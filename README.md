@@ -14,7 +14,6 @@ lg-aimers-sales-predictor/
 ├── dataset/
 │   ├── train/
 │   │   ├── train.csv              # Training data (copied from root)
-│   │   └── sample_submission.csv  # Submission template copied for convenience
 │   ├── test/
 │   │   ├── TEST_00.csv            # Past 28‑day sequences for test split 00
 │   │   ├── TEST_01.csv            # Test files 01–09 (provided by organisers)
