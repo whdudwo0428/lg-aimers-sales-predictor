@@ -101,7 +101,7 @@ def add_date_features(df: pd.DataFrame, date_col: str = '영업일자') -> pd.Da
     month = result['month']
     result['season'] = np.select(
         [month.isin([3, 4, 5]), month.isin([6, 7, 8]), month.isin([9, 10, 11])],
-        [1, 2, 3],
+        [12, 1, 2],
         default=4
     )
     # Ski season (1 if date falls in ski season; December–February)
