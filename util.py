@@ -107,7 +107,17 @@ def add_date_features(df: pd.DataFrame, date_col: str = '영업일자') -> pd.Da
     # Ski season (1 if date falls in ski season; December–February)
     result['ski_season'] = month.isin([12, 1, 2]).astype(int)
     return result
-
+    
+def add_store_menu_features(df: pd.DataFrame, col_name: str = '영업장명_메뉴명') -> pd.DataFrame:
+    """
+    '영업장명_메뉴명' 컬럼을 '_'로 분리해
+    '영업장명'과 '메뉴명' 컬럼을 생성합니다.
+    """
+    result = df.copy()
+    split_cols = result[col_name].str.split('_', n=1, expand=True)
+    result['영업장명'] = split_cols[0]
+    result['메뉴명'] = split_cols[1]
+    return result
 
 def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Compute the Symmetric Mean Absolute Percentage Error (SMAPE).
