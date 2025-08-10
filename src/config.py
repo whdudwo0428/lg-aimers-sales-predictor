@@ -10,10 +10,8 @@ import os
 
 
 class Config:
-    # ---------------------------------------------------------------
     # Model selection
-    # ---------------------------------------------------------------
-    MODEL_NAME: str = "fedformer"  # "fedformer" | "autoformer" | "patchtst" | "mamba"
+    MODEL_NAME: str = "autoformer"  # "fedformer" | "autoformer" | "patchtst" | "mamba"
 
     # ---------------------------------------------------------------
     # General / Paths
@@ -109,7 +107,22 @@ class Config:
         pass
 
     class PatchTST:
-        pass
+        D_MODEL = 128
+        N_HEADS = 8
+        E_LAYERS = 3
+        D_FF = 512
+        DROPOUT = 0.2
+        REVIN = True
+        AFFINE = False
+        INDIVIDUAL = False
+        FC_DROPOUT = 0.0
+        HEAD_DROPOUT = 0.0
+        PATCH_LEN = 16
+        STRIDE = 8
+        PADDING_PATCH = "end"
+        DECOMPOSITION = True
+        KERNEL_SIZE = 25
+        SUBTRACT_LAST = False
 
     class timesfm:
         pass

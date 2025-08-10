@@ -128,5 +128,16 @@ python -m src.predict_fedformer
 # 특정 ckpt 명시
 python -m src.predict_fedformer --ckpt "results/checkpoints/fedformer_d128_L2_seq28_h7_bs32_lr0.001.ckpt"
 
+---
+# 공통 훈련모델 train_any 사용법
+# config에서 MODEL_NAME = ~ 선택 후
+python -m src.train_any
+
+# 공통 예측모델 predict_any 사용법
+python -m src.predict_any --model autoformer
+python -m src.predict_any --model patchtst
+
+# 특정 ckpt 지정:
+python -m src.predict_any --model fedformer --ckpt results/checkpoints/fedformer_....ckpt   
 ```
 
