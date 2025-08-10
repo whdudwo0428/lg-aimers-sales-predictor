@@ -100,3 +100,26 @@ python -m src.predict_fedformer
 ## 📢 주의 사항
 
 현재 제공된 코드는 **학습과 추론의 전체 파이프라인을 보여주는 구조적 예시**이며, 실제 대회에서 높은 성능을 얻으려면 모델 정의와 학습 로직을 반드시 보완해야 합니다.  특히 FedFormer, PatchTST, TimesFM, Autoformer의 원본 구현을 import하여 `ForecastModel`을 교체하고, `predict.py`의 예측 로직을 완성해야 합니다.
+
+
+---
+```
+# 프로젝트 루트
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
+# 공통 의존성
+pip install -U pip wheel
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # GPU일 때; CPU면 일반 pip install torch ...
+pip install pytorch-lightning pandas numpy scikit-learn tqdm optuna
+
+# FEDformer 원본이 요구하는 추가 패키지(필요 시)
+pip install -r models/FEDformer/requirements.txt
+
+# 학습 실행
+python -m src.train_fedformer
+```
+

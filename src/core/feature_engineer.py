@@ -1,114 +1,159 @@
-"""Feature engineering helpers for time‑series forecasting.
+"""
+Feature engineering utilities for time‑series forecasting.
 
-This module exposes a small set of functions that operate on
-DataFrames containing ``date`` and ``sales`` columns to add useful
-features for sequence modelling.  These include cyclical encodings
-for calendar variables (weekday, month, day of year), lagged values
-and moving averages.
-
-Note that feature engineering is kept distinct from data loading to
-facilitate reuse across different models and experiments.  The
-functions here work with ``pandas`` objects and return new DataFrames
-with additional columns.
+This module defines reusable components that augment raw pivot tables
+with calendar‑based features, lagged values and moving averages.  The
+engineering is deliberately simple and deterministic: it does not
+require fitting on the training data and can therefore be applied
+consistently to both training and inference datasets without risk of
+data leakage.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 import numpy as np
+import datetime
+from typing import Iterable, Optional
 
-from typing import Iterable, List
+from .holidays import KOREAN_HOLIDAYS
 
 
-def add_date_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Enrich the dataframe with cyclic date features.
+def add_date_features(df: pd.DataFrame, date_col: str = "영업일자") -> pd.DataFrame:
+    """Augment a DataFrame with calendar‑based features.
 
-    Adds sine and cosine transforms of the weekday, month and day
-    within year in order to capture seasonality.  Also flags
-    weekends and Korean public holidays if ``holidays.py`` defines
-    them.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input table containing at least a date column.
+    date_col : str, default "영업일자"
+        Name of the column representing the business date.
 
-    Args:
-        df: DataFrame expected to contain a ``date`` column of
-            type ``datetime64[ns]``.
-
-    Returns:
-        DataFrame with new columns appended.  The original input is
-        not modified in place.
+    Returns
+    -------
+    pandas.DataFrame
+        A new DataFrame with the date column converted to a
+        ``datetime64`` dtype and additional calendar features such as
+        year, month, day of week, week number, weekend flag and
+        holiday flags.
     """
-    res = df.copy()
-    if "date" not in res.columns:
-        raise ValueError("DataFrame must contain a 'date' column for date features")
-    # Convert to pandas datetime just in case
-    res["date"] = pd.to_datetime(res["date"], errors="coerce")
-    # Extract calendar components
-    res["weekday"] = res["date"].dt.weekday
-    res["month"] = res["date"].dt.month
-    res["day_of_year"] = res["date"].dt.dayofyear
-    # Sine/cosine encodings
-    res["weekday_sin"] = np.sin(2 * np.pi * res["weekday"] / 7)
-    res["weekday_cos"] = np.cos(2 * np.pi * res["weekday"] / 7)
-    res["month_sin"] = np.sin(2 * np.pi * res["month"] / 12)
-    res["month_cos"] = np.cos(2 * np.pi * res["month"] / 12)
-    res["doy_sin"] = np.sin(2 * np.pi * res["day_of_year"] / 365)
-    res["doy_cos"] = np.cos(2 * np.pi * res["day_of_year"] / 365)
-    # Weekend flag
-    res["is_weekend"] = (res["weekday"] >= 5).astype(int)
-    # Holiday flag – optional
-    try:
-        from .holidays import KOREAN_HOLIDAYS
-        res["is_holiday"] = res["date"].dt.strftime("%Y-%m-%d").isin(KOREAN_HOLIDAYS).astype(int)
-    except Exception:
-        # If holiday list is not available just set zero
-        res["is_holiday"] = 0
-    return res
+    result = df.copy()
+    result[date_col] = pd.to_datetime(result[date_col])
+    dt_series = result[date_col]
+
+    result["year"] = dt_series.dt.year
+    result["month"] = dt_series.dt.month
+    result["day"] = dt_series.dt.day
+    result["dayofweek"] = dt_series.dt.dayofweek  # Monday=0
+    result["weekofyear"] = dt_series.dt.isocalendar().week.astype(int)
+    result["is_weekend"] = result["dayofweek"].isin([5, 6]).astype(int)
+
+    # Holiday flags
+    date_list = dt_series.dt.date
+    result["is_holiday"] = date_list.isin(KOREAN_HOLIDAYS).astype(int)
+
+    # Before/after holiday flags
+    holiday_set = set(KOREAN_HOLIDAYS)
+    before_holiday = {d - datetime.timedelta(days=1) for d in holiday_set}
+    after_holiday = {d + datetime.timedelta(days=1) for d in holiday_set}
+    result["is_holiday_eve"] = date_list.isin(before_holiday).astype(int)
+    result["is_holiday_after"] = date_list.isin(after_holiday).astype(int)
+
+    # Quarter and day of year
+    result["quarter"] = dt_series.dt.quarter
+    result["dayofyear"] = dt_series.dt.day_of_year
+
+    # Season indicator: Winter=4, Spring=1, Summer=2, Autumn=3.  This
+    # encoding preserves ordinal relationships across seasons but
+    # deliberately reorders to capture the ski season as a contiguous
+    # block (1: Spring, 2: Summer, 3: Autumn, 4: Winter).  Adjust
+    # values if you desire a different mapping.
+    month = result["month"]
+    result["season"] = np.select(
+        [month.isin([3, 4, 5]), month.isin([6, 7, 8]), month.isin([9, 10, 11])],
+        [1, 2, 3],
+        default=4,
+    ).astype(int)
+
+    # Ski season flag (December through February)
+    result["ski_season"] = month.isin([12, 1, 2]).astype(int)
+
+    return result
 
 
-def add_lag_features(df: pd.DataFrame, periods: Iterable[int], group_col: str = "store_item") -> pd.DataFrame:
-    """Add lagged sales features to a DataFrame.
+class FeatureEngineer:
+    """Generate lag and moving average features for a pivoted DataFrame.
 
-    For each integer ``p`` in ``periods`` a new column named
-    ``lag_p`` is created containing the value of ``sales`` shifted
-    backwards by ``p`` days.  The lags are computed per group (e.g.
-    store or item) if ``group_col`` is provided.
-
-    Args:
-        df: DataFrame with at least ``sales`` and ``date`` columns.
-        periods: Iterable of lag offsets in days.
-        group_col: Column to group by when computing lags.
-
-    Returns:
-        Copy of ``df`` with additional lag columns.
+    The :class:`TimeSeriesDataModule` orchestrates feature engineering by
+    combining the raw pivot table with the outputs of a
+    :class:`FeatureEngineer` instance.  Only lag features and
+    moving–average features are supported; no fitting is performed on
+    the data, thereby avoiding data leakage into the validation and
+    test splits.
     """
-    res = df.copy()
-    if group_col not in res.columns:
-        raise ValueError(f"Group column '{group_col}' must exist in DataFrame")
-    for p in periods:
-        col_name = f"lag_{p}"
-        res[col_name] = res.groupby(group_col)["sales"].shift(p)
-    return res
+
+    def __init__(self, lag_periods: Optional[Iterable[int]] = None, ma_windows: Optional[Iterable[int]] = None) -> None:
+        self.lag_periods = list(lag_periods) if lag_periods is not None else []
+        self.ma_windows = list(ma_windows) if ma_windows is not None else []
+
+    def _create_lag_features(self, df: pd.DataFrame) -> list[pd.DataFrame]:
+        """Return a list of DataFrames containing lagged values for each column.
+
+        Each DataFrame in the returned list has the same index as the input
+        and contains one column per original series, with the suffix
+        ``_lag_{lag}`` appended to the column name.  If no lag periods are
+        specified an empty list is returned.
+        """
+        if not self.lag_periods:
+            return []
+        features = []
+        for lag in self.lag_periods:
+            shifted = df.shift(lag).rename(columns=lambda c: f"{c}_lag_{lag}")
+            features.append(shifted)
+        return features
+
+    def _create_ma_features(self, df: pd.DataFrame) -> list[pd.DataFrame]:
+        """Return a list of DataFrames containing rolling mean values.
+
+        Each DataFrame in the returned list has the same index as the input
+        and contains one column per original series, with the suffix
+        ``_ma_{window}`` appended to the column name.  Rolling means are
+        computed with a minimum window of 1 so that the early part of the
+        series is not discarded.  If no windows are specified an empty
+        list is returned.
+        """
+        if not self.ma_windows:
+            return []
+        features = []
+        for window in self.ma_windows:
+            rolled = df.rolling(window=window, min_periods=1).mean().rename(
+                columns=lambda c: f"{c}_ma_{window}"
+            )
+            features.append(rolled)
+        return features
+
+    def transform(self, pivot_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Generate lag and moving–average features for a pivoted table.
+
+        Parameters
+        ----------
+        pivot_df : pandas.DataFrame
+            A DataFrame indexed by date with one column per item.  The
+            index must be monotonically increasing and contiguous; gaps
+            will propagate through the lagged features.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            A DataFrame containing all engineered features, or ``None``
+            if no lags and moving average windows have been defined.
+        """
+        additional = []
+        additional.extend(self._create_lag_features(pivot_df))
+        additional.extend(self._create_ma_features(pivot_df))
+        if not additional:
+            return None
+        return pd.concat(additional, axis=1)
 
 
-def add_moving_average_features(df: pd.DataFrame, windows: Iterable[int], group_col: str = "store_item") -> pd.DataFrame:
-    """Add moving average sales features.
-
-    For each integer ``w`` in ``windows`` a new column named
-    ``ma_w`` is created containing the rolling mean of ``sales`` over
-    the previous ``w`` days, computed per group.
-
-    Args:
-        df: DataFrame with at least ``sales`` and ``date`` columns.
-        windows: Iterable of window sizes.
-        group_col: Column used to group data before computing the
-            rolling statistics.
-
-    Returns:
-        Copy of ``df`` with additional moving average columns.
-    """
-    res = df.copy()
-    if group_col not in res.columns:
-        raise ValueError(f"Group column '{group_col}' must exist in DataFrame")
-    for w in windows:
-        col_name = f"ma_{w}"
-        res[col_name] = res.groupby(group_col)["sales"].rolling(window=w, min_periods=1).mean().reset_index(level=0, drop=True)
-    return res
+__all__ = ["add_date_features", "FeatureEngineer"]

@@ -1,96 +1,71 @@
-import torch
-import torch.nn as nn
-from layers.Embed import DataEmbedding_wo_pos
-from layers.AutoCorrelation import AutoCorrelation, AutoCorrelationLayer
-from layers.Autoformer_EncDec import Encoder, Decoder, EncoderLayer, DecoderLayer, my_Layernorm, series_decomp
+# src/models/model_autoformer.py
+from __future__ import annotations
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict
+import torch, torch.nn as nn
 
+def _import_original_autoformer():
+    root = Path(__file__).resolve().parents[2] / "models" / "Autoformer"
+    src_file = root / "models" / "Autoformer.py"
+    if not src_file.exists():
+        raise ImportError(f"[Autoformer] File not found: {src_file}")
+    sys.path.insert(0, str(root))
+    import importlib.util as ilu
+    spec = ilu.spec_from_file_location("autoformer_original", src_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"[Autoformer] Failed to load spec: {src_file}")
+    module = ilu.module_from_spec(spec); spec.loader.exec_module(module)  # type: ignore
+    if not hasattr(module, "Model"):
+        raise ImportError("[Autoformer] 'Model' not found in Autoformer.py")
+    return module.Model
 
-class Model(nn.Module):
-    """
-    Autoformer is the first method to achieve the series-wise connection,
-    with inherent O(LlogL) complexity
-    """
-    def __init__(self, configs):
-        super(Model, self).__init__()
-        self.seq_len = configs.seq_len
-        self.label_len = configs.label_len
-        self.pred_len = configs.pred_len
-        self.output_attention = configs.output_attention
+def _build_cfg(cfg: Any, input_dim: int):
+    F = cfg.FEDformer  # 기본 하이퍼를 공유(필요 시 별도 섹션으로 분리 가능)
+    return SimpleNamespace(
+        seq_len=cfg.SEQ_LEN, label_len=cfg.LABEL_LEN, pred_len=cfg.HORIZON,
+        enc_in=input_dim, dec_in=input_dim, c_out=input_dim,
+        d_model=F.D_MODEL, n_heads=F.N_HEADS, d_ff=F.D_FF,
+        e_layers=F.E_LAYERS, d_layers=F.D_LAYERS, dropout=F.DROPOUT,
+        embed=F.EMBED, freq=F.FREQ, activation=F.ACTIVATION,
+        output_attention=getattr(F, "OUTPUT_ATTENTION", False),
+        moving_avg=getattr(F, "MOVING_AVG", 25), factor=getattr(F, "FACTOR", 1),
+    )
 
-        # Decomp
-        kernel_size = configs.moving_avg
-        self.decomp = series_decomp(kernel_size)
+class AutoformerModel(nn.Module):
+    def __init__(self, original: nn.Module, cfg: Any):
+        super().__init__()
+        self._orig = original
+        self._cfg = cfg
+        self._label_len = cfg.LABEL_LEN
+        self._horizon = cfg.HORIZON
 
-        # Embedding
-        # The series-wise connection inherently contains the sequential information.
-        # Thus, we can discard the position embedding of transformers.
-        self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
-                                                  configs.dropout)
-        self.dec_embedding = DataEmbedding_wo_pos(configs.dec_in, configs.d_model, configs.embed, configs.freq,
-                                                  configs.dropout)
+    @classmethod
+    def from_config(cls, cfg: Any, input_dim: int) -> "AutoformerModel":
+        Original = _import_original_autoformer()
+        ocfg = _build_cfg(cfg, input_dim)
+        return cls(Original(ocfg), cfg)
 
-        # Encoder
-        self.encoder = Encoder(
-            [
-                EncoderLayer(
-                    AutoCorrelationLayer(
-                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
-                                        output_attention=configs.output_attention),
-                        configs.d_model, configs.n_heads),
-                    configs.d_model,
-                    configs.d_ff,
-                    moving_avg=configs.moving_avg,
-                    dropout=configs.dropout,
-                    activation=configs.activation
-                ) for l in range(configs.e_layers)
-            ],
-            norm_layer=my_Layernorm(configs.d_model)
-        )
-        # Decoder
-        self.decoder = Decoder(
-            [
-                DecoderLayer(
-                    AutoCorrelationLayer(
-                        AutoCorrelation(True, configs.factor, attention_dropout=configs.dropout,
-                                        output_attention=False),
-                        configs.d_model, configs.n_heads),
-                    AutoCorrelationLayer(
-                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
-                                        output_attention=False),
-                        configs.d_model, configs.n_heads),
-                    configs.d_model,
-                    configs.c_out,
-                    configs.d_ff,
-                    moving_avg=configs.moving_avg,
-                    dropout=configs.dropout,
-                    activation=configs.activation,
-                )
-                for l in range(configs.d_layers)
-            ],
-            norm_layer=my_Layernorm(configs.d_model),
-            projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
-        )
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        x_enc      = batch["x_enc"]       # (B,L,N)
+        x_mark_enc = batch["x_mark_enc"]  # (B,L,T_full)
+        y_mark_dec = batch["y_mark_dec"]  # (B,Lc+H,T_full)
+        B, L, N = x_enc.shape; Lc = self._label_len; H = self._horizon
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec,
-                enc_self_mask=None, dec_self_mask=None, dec_enc_mask=None):
-        # decomp init
-        mean = torch.mean(x_enc, dim=1).unsqueeze(1).repeat(1, self.pred_len, 1)
-        zeros = torch.zeros([x_dec.shape[0], self.pred_len, x_dec.shape[2]], device=x_enc.device)
-        seasonal_init, trend_init = self.decomp(x_enc)
-        # decoder input
-        trend_init = torch.cat([trend_init[:, -self.label_len:, :], mean], dim=1)
-        seasonal_init = torch.cat([seasonal_init[:, -self.label_len:, :], zeros], dim=1)
-        # enc
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        enc_out, attns = self.encoder(enc_out, attn_mask=enc_self_mask)
-        # dec
-        dec_out = self.dec_embedding(seasonal_init, x_mark_dec)
-        seasonal_part, trend_part = self.decoder(dec_out, enc_out, x_mask=dec_self_mask, cross_mask=dec_enc_mask,
-                                                 trend=trend_init)
-        # final
-        dec_out = trend_part + seasonal_part
+        # decoder signal: [label_len; zeros]
+        x_dec = torch.zeros((B, Lc + H, N), device=x_enc.device, dtype=x_enc.dtype)
+        x_dec[:, :Lc, :] = x_enc[:, -Lc:, :]
 
-        if self.output_attention:
-            return dec_out[:, -self.pred_len:, :], attns
-        else:
-            return dec_out[:, -self.pred_len:, :]  # [B, L, D]
+        # Autoformer도 timeF 임베딩 in_features가 작을 수 있으니 슬라이스
+        try:
+            t_exp = self._orig.enc_embedding.temporal_embedding.embed.in_features
+            if x_mark_enc.size(-1) != t_exp:
+                x_mark_enc = x_mark_enc[..., :t_exp]
+                y_mark_dec = y_mark_dec[..., :t_exp]
+        except Exception:
+            pass
+
+        out = self._orig(x_enc, x_mark_enc, x_dec, y_mark_dec)
+        if isinstance(out, tuple): out = out[0]
+        return out[:, -H:, :]

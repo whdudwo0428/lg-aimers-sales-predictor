@@ -1,105 +1,80 @@
-"""Data loading and basic preprocessing routines.
+"""
+Lightweight data loading utilities for the LG Aimers forecasting task.
 
-The functions defined in this module provide a thin abstraction over
-``pandas.read_csv`` to load the training and test data supplied in
-the LG Aimers forecasting challenge.  They normalise column names,
-parse dates, ensure data types are consistent and perform some
-simple cleaning such as dropping duplicate records and filling
-missing values.
+This module centralises the reading of raw CSV files for both the
+training set and the multiple test batches.  Separating IO logic into
+its own file simplifies unit testing and decouples data access from
+the rest of the pipeline.  All functions are pure and return pandas
+DataFrames without performing any pivoting or feature engineering.
 
-These helpers intentionally do not perform any feature engineering –
-that is handled in ``core.feature_engineer``.  The idea is to keep
-data ingestion and low‑level cleaning in one place so it can be
-reused across different models.
+Usage
+-----
+Import the convenience functions and call them with explicit paths::
+
+    from src.core.data_loader import read_train_data, read_test_data
+    train_df = read_train_data("dataset/train/train.csv")
+    test_dfs = read_test_data("dataset/test")
+
+These functions do not enforce any particular schema beyond requiring
+the presence of the columns ``영업일자``, ``영업장명_메뉴명`` and
+``매출수량``.  They simply read and return the contents of the CSV
+files.  Any further processing (pivoting, feature engineering,
+windowing) is handled by :mod:`src.core.data_module`.
 """
 
 from __future__ import annotations
 
 import os
-from typing import List, Tuple
-
+import glob
 import pandas as pd
+from typing import Dict, List
 
 
-def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename canonical columns and coerce types.
+def read_train_data(path: str) -> pd.DataFrame:
+    """Read the training CSV file into a DataFrame.
 
-    The original dataset uses Korean column names (e.g. ``영업일자`` for
-    date).  This helper renames them to English identifiers
-    (``date``, ``store_item``, ``sales``) and converts the ``date`` column
-    to a ``datetime64[ns]`` dtype.  Duplicate rows are dropped and
-    missing sales values are replaced with zeros.
+    Parameters
+    ----------
+    path : str
+        Full path to the ``train.csv`` file.  Must include the
+        directory and filename.
 
-    Args:
-        df: Raw dataframe as loaded from CSV.
-
-    Returns:
-        Normalised dataframe.
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing the entire training set.
     """
-    col_map = {
-        "영업일자": "date",
-        "영업장명_메뉴명": "store_item",
-        "매출수량": "sales",
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    if "sales" in df.columns:
-        # Some CSVs may include commas as thousand separators; remove them
-        df["sales"] = pd.to_numeric(df["sales"].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
-    # Drop duplicate records based on date and item
-    if {"date", "store_item"}.issubset(df.columns):
-        df = df.drop_duplicates(subset=["date", "store_item"])
-    # Fill any remaining NaNs
-    return df.fillna(0.0)
-
-
-def load_train(train_dir: str) -> pd.DataFrame:
-    """Load and preprocess the training CSV.
-
-    Args:
-        train_dir: Path to the folder containing ``train.csv``.
-
-    Returns:
-        DataFrame with columns ``date``, ``store_item`` and ``sales``.
-    """
-    csv_path = os.path.join(train_dir, "train.csv")
-    df = pd.read_csv(csv_path, encoding="utf-8")
-    df = _normalise_columns(df)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Training file not found: {path}")
+    df = pd.read_csv(path)
     return df
 
 
-def load_test(test_dir: str) -> List[pd.DataFrame]:
-    """Load all test CSVs from a directory.
+def read_test_data(directory: str) -> Dict[str, pd.DataFrame]:
+    """Read all test batch CSV files into a mapping of name to DataFrame.
 
-    The challenge distributes test files as ``TEST_00.csv`` through
-    ``TEST_09.csv``.  This helper returns a list of DataFrames, one
-    per file, with normalised columns.
+    Parameters
+    ----------
+    directory : str
+        Path to the directory containing test batch files.  All files
+        matching the pattern ``TEST_*.csv`` will be read.
 
-    Args:
-        test_dir: Path to the folder containing ``TEST_*.csv`` files.
-
-    Returns:
-        List of DataFrames in arbitrary order.
+    Returns
+    -------
+    dict
+        A dictionary mapping the base filename (e.g. ``TEST_00``) to
+        the corresponding DataFrame.  The dictionary is sorted by
+        filename to provide deterministic ordering.
     """
-    files = [f for f in os.listdir(test_dir) if f.lower().endswith(".csv")]
-    dfs: List[pd.DataFrame] = []
-    for fname in sorted(files):
-        path = os.path.join(test_dir, fname)
-        df = pd.read_csv(path, encoding="utf-8")
-        df = _normalise_columns(df)
-        dfs.append(df)
-    return dfs
+    pattern = os.path.join(directory, "TEST_*.csv")
+    files: List[str] = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No test files found in {directory}")
+    data: Dict[str, pd.DataFrame] = {}
+    for file in files:
+        key = os.path.splitext(os.path.basename(file))[0]
+        data[key] = pd.read_csv(file)
+    return data
 
 
-def load_sample_submission(path: str) -> pd.DataFrame:
-    """Load the sample submission CSV.
-
-    This file defines the submission format expected by the
-    competition platform.  It typically contains columns
-    ``id``/``store_item`` and ``sales`` or similar.  The loader
-    normalises column names but does not alter the content.
-    """
-    df = pd.read_csv(path, encoding="utf-8")
-    df = _normalise_columns(df)
-    return df
+__all__ = ["read_train_data", "read_test_data"]

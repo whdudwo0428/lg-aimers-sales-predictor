@@ -94,7 +94,7 @@ def train():
     # val_loss를 모니터링하여 가장 좋은 모델을 저장하는 콜백
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
-        dirpath="fedformer_model/",
+        dirpath="./fedformer_model/",
         filename="best-fedformer-model-{epoch:02d}-{val_loss:.2f}",
         save_top_k=1, # 가장 좋은 모델 1개만 저장
         mode="min",   # monitor하는 지표가 낮을수록 좋음

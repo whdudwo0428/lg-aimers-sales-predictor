@@ -1,62 +1,115 @@
-import torch
+"""
+Global configuration for the forecasting pipeline.
+
+This module centralises hyperparameters, file paths and runtime options
+so different environments (macOS MPS / CUDA / CPU) can run with the same code.
+"""
+
+from __future__ import annotations
+import os
+
 
 class Config:
-    # --- 데이터, 공통 설정 ---
-    SEED = 42
-    FILE_PATH = 'dataset/train/train.csv'
-    SEQ_LEN = 28
-    HORIZON = 7
-    LABEL_LEN = 28
-    BATCH_SIZE = 64
-    MAX_EPOCHS = 50
-    PATIENCE = 10
-    ACCELERATOR = 'auto'
-    DEVICES = 'auto'
+    # ---------------------------------------------------------------
+    # Model selection
+    # ---------------------------------------------------------------
+    MODEL_NAME: str = "fedformer"  # "fedformer" | "autoformer" | "patchtst" | "mamba"
 
-    # --- FEATURE ENGINEERING ---
-    LAG_PERIODS = [7, 14]
-    MA_WINDOWS = [7, 28]
+    # ---------------------------------------------------------------
+    # General / Paths
+    # ---------------------------------------------------------------
+    SEED: int = 42
 
-    # --- 모델 공통 설정 ---
-    LEARNING_RATE = 1e-4
-    LOSS_FN = torch.nn.MSELoss()
+    # Data paths (relative to project root when running: `python -m src.train_fedformer`)
+    TRAIN_FILE: str = os.path.join("dataset", "train", "train.csv")
+    TEST_DIR: str = os.path.join("dataset", "test")
+    SAMPLE_SUBMISSION: str = os.path.join("dataset", "sample_submission.csv")
 
-    # --- Autoformer 모델 전용 하이퍼파라미터 ---
+    RESULTS_DIR: str = "results"
+    CHECKPOINT_DIR: str = os.path.join(RESULTS_DIR, "checkpoints")
+    PREDS_DIR: str = os.path.join(RESULTS_DIR, "preds")
+    SUBMISSION_FILE: str = os.path.join(RESULTS_DIR, "submission.csv")
+
+    # Backward compatibility alias (some old scripts expect FILE_PATH)
+    FILE_PATH: str = TRAIN_FILE
+
+    # ---------------------------------------------------------------
+    # Data handling
+    # ---------------------------------------------------------------
+    SEQ_LEN: int = 28
+    HORIZON: int = 7
+    LABEL_LEN: int = 28
+
+    BATCH_SIZE: int = 32
+    EPOCHS: int = 20
+
+    # Use 0 on Windows if you hit DataLoader spawn issues
+    NUM_WORKERS: int = 4
+
+    # ---------------------------------------------------------------
+    # Trainer runtime (cross-platform)
+    # ---------------------------------------------------------------
+    # Let Lightning auto-detect (CUDA/ROCm/MPS/CPU)
+    ACCELERATOR: str = "auto"      # "auto" | "gpu" | "cpu" | "mps" | ...
+    DEVICES: str | int | list[int] = "auto"  # "auto" or an int or list of device indices
+    # Precision per PL 2.x naming: "32-true" | "16-mixed" | "bf16-mixed" | "64-true"
+    # Keep a single source of truth—don't infer from AMP flag anymore.
+    PRECISION: str = "32-true"
+
+    # Logging & training niceties
+    LOG_EVERY_N_STEPS: int = 5
+    GRAD_CLIP: float = 0.0
+
+    # ---------------------------------------------------------------
+    # Optimisation
+    # ---------------------------------------------------------------
+    LR: float = 1e-3
+    WD: float = 1e-4
+    PATIENCE: int = 5
+
+    # ---------------------------------------------------------------
+    # Model: FEDformer
+    # ---------------------------------------------------------------
+    class FEDformer:
+        D_MODEL: int = 128
+        N_HEADS: int = 8
+        E_LAYERS: int = 2
+        D_LAYERS: int = 1
+        D_FF: int = 512
+        DROPOUT: float = 0.05
+
+        OUTPUT_ATTENTION: bool = False
+        EMBED: str = "timeF"
+        FREQ: str = "d"
+        ACTIVATION: str = "gelu"
+
+        # Compatibility knobs (kept to match original repo arguments)
+        VERSION: str = "Fourier"
+        MODE_SELECT: str = "random"
+        MODES: int = 32
+        MOVING_AVG: int = 25
+        DISTIL: bool = True
+        FACTOR: int = 1
+
+        # Wavelet variant (unused unless VERSION == 'Wavelets')
+        L: int = 1
+        BASE: str = "legendre"
+        CROSS_ACTIVATION: str = "tanh"
+
+    # ---------------------------------------------------------------
+    # Feature engineering (date-only as per rules)
+    # ---------------------------------------------------------------
+    LAG_PERIODS: tuple[int, ...] = (7, 14)
+    MA_WINDOWS: tuple[int, ...] = (7, 28)
+
+    # ---------------------------------------------------------------
+    # Placeholders for other models
+    # ---------------------------------------------------------------
     class Autoformer:
-        None
-
-    '''
-    @train_model
-    class ModelConfigs:
         pass
 
-    model_params = ModelConfigs()
-    model_cfg = cfg.FEDformer # config.py의 FEDformer 중첩 클래스
-    '''
-    # --- FEDformer 모델 전용 하이퍼파라미터 ---
-    class FEDformer:
-        D_MODEL = 512
-        N_HEADS = 8
-        E_LAYERS = 2
-        D_LAYERS = 1
-        D_FF = 2048
-        DROPOUT = 0.05
-        OUTPUT_ATTENTION = True
-        EMBED = 'timeF'
-        FREQ = 'd'
-        ACTIVATION = 'gelu'
-        VERSION = 'Fourier'
-        MODE_SELECT = 'random'
-        MODES = 64
-        MOVING_AVG = 25
-        DISTIL = True
-        FACTOR = 1
-
-    # --- PatchTST 모델 전용 하이퍼파라미터 ---
     class PatchTST:
-        None
+        pass
 
-    # --- timesfm 모델 전용 하이퍼파라미터 ---
     class timesfm:
-        None
-
+        pass
