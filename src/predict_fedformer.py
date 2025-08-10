@@ -1,91 +1,54 @@
-"""
-Entry point for generating predictions with the FEDformer wrapper.
-
-This script loads the most recent checkpoint from
-``results/checkpoints``, reconstructs the model and associated data
-module and produces forecasts for each test batch (``TEST_00.csv`` …
-``TEST_09.csv``).  Individual predictions for each test file are
-stored under ``results/preds/fedformer`` and the final merged
-submission is written to ``results/submission.csv``.
-
-Usage
------
-Run the following command from the project root::
-
-    python -m src.models.predict_fedformer
-
-Prerequisites
--------------
-* A trained model checkpoint must exist in ``results/checkpoints``.  If
-  multiple checkpoints are present the most recently modified file is
-  used.
-* The test files must be located in ``dataset/test`` and follow the
-  naming convention ``TEST_XX.csv``.
-* The sample submission must be available at
-  ``dataset/sample_submission.csv``.
-"""
-
+# src/predict_fedformer.py
 from __future__ import annotations
 
-import os
-import glob
-from typing import List, Dict
-
-import pandas as pd
+import os, re, glob, argparse, datetime
 import numpy as np
-from ..config import Config
-from ..core.data_module import TimeSeriesDataModule
-from ..core.feature_engineer import FeatureEngineer
-from ..core.utils import seed_everything
-from .model_fedformer import FedformerModel
+import pandas as pd
+import torch
 
-# We avoid importing torch and pytorch_lightning at module load time
-# because these libraries may not be installed in the execution
-# environment.  Instead, we import them within the predict() function.
+from .config import Config
+from .core.data_module import TimeSeriesDataModule
+from .core.feature_engineer import FeatureEngineer, add_date_features
+from .models.model_fedformer import FedformerModel
+from .core.lightning_module import LitModel
 
+def _find_ckpt(cfg: Config, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    patt = os.path.join(cfg.CHECKPOINT_DIR, "fedformer_*.ckpt")
+    cks = sorted(glob.glob(patt), key=os.path.getmtime, reverse=True)
+    if not cks:
+        raise FileNotFoundError(f"No checkpoint found under {cfg.CHECKPOINT_DIR}")
+    return cks[0]
 
-def load_latest_checkpoint(checkpoint_dir: str) -> str:
-    """Return the path to the most recently modified checkpoint file."""
-    ckpts = glob.glob(os.path.join(checkpoint_dir, "*.ckpt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    ckpts.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return ckpts[0]
+def _param_tag(cfg: Config) -> str:
+    f = cfg.FEDformer
+    return f"d{f.D_MODEL}_L{f.E_LAYERS}_seq{cfg.SEQ_LEN}_h{cfg.HORIZON}_bs{cfg.BATCH_SIZE}_lr{cfg.LR}"
 
+def _to_submission_format(pred_df: pd.DataFrame, sample_submission_path: str) -> pd.DataFrame:
+    # LSTM 예시와 동일한 변환 로직
+    sample_submission = pd.read_csv(sample_submission_path)
+    pred_dict = dict(zip(zip(pred_df["영업일자"], pred_df["영업장명_메뉴명"]), pred_df["매출수량"]))
+    final_df = sample_submission.copy()
+    for row_idx in final_df.index:
+        date = final_df.loc[row_idx, "영업일자"]
+        for col in final_df.columns[1:]:
+            final_df.loc[row_idx, col] = pred_dict.get((date, col), 0)
+    return final_df  # 【참고】LSTM 변환 로직【turn16file1†lstm.py†L29-L39】
 
-def predict() -> None:
-    """Run inference using the most recently saved checkpoint.
-
-    This function loads the latest checkpoint, reconstructs the model
-    and data module, generates predictions for each test batch and
-    writes both per‑file and merged submission outputs.  Imports of
-    torch and PyTorch Lightning occur inside this function to
-    gracefully handle environments where they are unavailable.  If
-    these libraries are missing the function will emit a message and
-    return without performing inference.
-    """
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        print("[predict_fedformer] PyTorch is not installed. Skipping prediction.")
-        return
-
-    from ..core.lightning_module import LitModel  # import lazily
-    # Attempt to import optional PyTorch Lightning, but we don't strictly need it here
-    try:
-        import pytorch_lightning as pl  # noqa: F401
-    except ImportError:
-        # Continue without lightning; we still need the checkpoint loader defined on LitModel
-        pass
-
+@torch.no_grad()
+def main():
     cfg = Config()
-    seed_everything(cfg.SEED)
 
-    # Locate checkpoint
-    best_ckpt = load_latest_checkpoint(cfg.CHECKPOINT_DIR)
-    print(f"Loading checkpoint: {best_ckpt}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", type=str, default=None, help="checkpoint path (optional)")
+    ap.add_argument("--outdir", type=str, default=cfg.RESULTS_DIR)
+    args = ap.parse_args()
 
-    # Prepare data module (training data only to define pivot and features)
+    ckpt_path = _find_ckpt(cfg, args.ckpt)
+    os.makedirs(cfg.RESULTS_DIR, exist_ok=True)
+
+    # --- Data schema from training ---
     fe = FeatureEngineer(cfg.LAG_PERIODS, cfg.MA_WINDOWS)
     dm = TimeSeriesDataModule(
         file_path=cfg.TRAIN_FILE,
@@ -94,88 +57,99 @@ def predict() -> None:
         label_len=cfg.LABEL_LEN,
         batch_size=cfg.BATCH_SIZE,
         feature_engineer=fe,
-        num_workers=cfg.NUM_WORKERS,
+        num_workers=0,
     )
-    dm.prepare_data()
+    dm.prepare_data()  # restore target columns & time feature names
 
-    input_dim = dm.input_dim
     item_names = list(dm.target_columns)
+    time_cols = list(dm.time_feature_columns)
+    n_items = len(item_names)
 
-    # Instantiate model and LightningModule, then load weights
-    model = FedformerModel.from_config(cfg, input_dim=input_dim)
-    lit_model = LitModel(model=model, cfg=cfg, item_names=item_names)
-    # Load from checkpoint; pass through model and cfg to satisfy constructor
-    lit_model = LitModel.load_from_checkpoint(
-        checkpoint_path=best_ckpt,
-        model=model,
-        cfg=cfg,
-        item_names=item_names,
-    )
-    lit_model.eval()
-    lit_model.freeze()
-
-    # Device placement: use GPU if available
+    # --- Model & checkpoint ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lit_model.to(device)
+    model = FedformerModel.from_config(cfg, input_dim=n_items).to(device)
+    lit = LitModel(model=model, cfg=cfg, item_names=item_names).to(device)
 
-    preds_dir = os.path.join(cfg.PREDS_DIR, "fedformer")
-    os.makedirs(preds_dir, exist_ok=True)
+    state = torch.load(ckpt_path, map_location=device)
+    missing, unexpected = lit.load_state_dict(state["state_dict"], strict=False)
+    if missing or unexpected:
+        print(f"[warn] missing={missing}, unexpected={unexpected}")
 
-    all_pred_rows: List[Dict[str, any]] = []
+    model.eval()
 
+    # --- Predict per TEST_xx.csv ---
+    results_long = []
     test_files = sorted(glob.glob(os.path.join(cfg.TEST_DIR, "TEST_*.csv")))
     for path in test_files:
-        df_test = pd.read_csv(path)
-        prefix = os.path.splitext(os.path.basename(path))[0]
-        prepared = dm.preprocess_inference_data(df_test)
-        seqs = dm._create_sequences(prepared)
-        if seqs[0].size == 0:
-            print(f"Warning: no sequences created for {path}; skipping this file.")
+        test_df = pd.read_csv(path)
+        # into training schema (same columns & time features)
+        prepared = dm.preprocess_inference_data(test_df)
+
+        if len(prepared) < cfg.SEQ_LEN:
+            print(f"[skip] {os.path.basename(path)} has only {len(prepared)} rows (< SEQ_LEN).")
             continue
-        x_enc_np, y_seq_np, x_mark_np, y_mark_np = seqs
-        x_enc = torch.from_numpy(x_enc_np[-1:]).to(device)
-        x_mark = torch.from_numpy(x_mark_np[-1:]).to(device)
-        y_mark = torch.from_numpy(y_mark_np[-1:]).to(device)
-        batch_dict = {
-            "x_enc": x_enc,
-            "x_mark_enc": x_mark,
-            "y_mark_dec": y_mark,
+
+        # encoder inputs
+        x_all = prepared[item_names].astype(np.float32)
+        x_enc_np = x_all.tail(cfg.SEQ_LEN).to_numpy()                    # (seq, N)
+        x_mark_enc_np = prepared[time_cols].tail(cfg.SEQ_LEN).astype(np.float32).to_numpy()  # (seq, T)
+
+        # decoder time marks: last LABEL_LEN days + next HORIZON days
+        hist_idx = prepared.index[-cfg.LABEL_LEN:]
+        fut_idx = pd.date_range(prepared.index[-1] + pd.Timedelta(days=1),
+                                periods=cfg.HORIZON, freq="D")
+        # hist part from prepared, future part via add_date_features
+        hist_marks = prepared.loc[hist_idx, time_cols].astype(np.float32)
+        fut_marks = add_date_features(pd.DataFrame({"영업일자": fut_idx}), "영업일자")
+        fut_marks.set_index("영업일자", inplace=True)
+        fut_marks = fut_marks[time_cols].astype(np.float32)
+        y_mark_dec_np = pd.concat([hist_marks, fut_marks], axis=0).to_numpy(dtype=np.float32)  # (label_len+h, T)
+
+        # Pack batch dict expected by model wrapper
+        batch = {
+            "x_enc": torch.from_numpy(x_enc_np).unsqueeze(0).to(device).float(),
+            "x_mark_enc": torch.from_numpy(x_mark_enc_np).unsqueeze(0).to(device).float(),
+            "y_mark_dec": torch.from_numpy(y_mark_dec_np).unsqueeze(0).to(device).float(),
         }
-        with torch.no_grad():
-            pred = lit_model.model(batch_dict)
-        pred_np = pred.squeeze(0).cpu().numpy()
-        pred_np = np.clip(pred_np, 0, None)
-        pred_np = np.rint(pred_np).astype(int)
-        horizon = pred_np.shape[0]
-        for i in range(horizon):
-            date_str = f"{prefix}+{i+1}일"
-            for item_idx, item_name in enumerate(item_names):
-                value = int(pred_np[i, item_idx])
-                all_pred_rows.append({
-                    "영업일자": date_str,
-                    "영업장명_메뉴명": item_name,
-                    "매출수량": value,
-                })
-        file_pred_df = pd.DataFrame([
-            {"영업일자": f"{prefix}+{i+1}일", **{item_names[j]: pred_np[i, j] for j in range(len(item_names))}}
-            for i in range(horizon)
-        ])
-        file_pred_path = os.path.join(preds_dir, f"{prefix}.csv")
-        file_pred_df.to_csv(file_pred_path, index=False, encoding="utf-8-sig")
-        print(f"Saved predictions for {prefix} to {file_pred_path}")
 
-    # Assemble full prediction DataFrame
-    sample = pd.read_csv(cfg.SAMPLE_SUBMISSION)
-    pred_dict = {(row["영업일자"], row["영업장명_메뉴명"]): row["매출수량"] for row in all_pred_rows}
-    final_df = sample.copy()
-    for idx in final_df.index:
-        date = final_df.loc[idx, "영업일자"]
-        for col in final_df.columns[1:]:
-            final_df.loc[idx, col] = pred_dict.get((date, col), 0)
+        yhat = model(batch)  # (1, H, N)  — wrapper forwards to original
+        yhat = yhat.squeeze(0).cpu().numpy()  # (H, N)
+
+        # clip & round like baseline
+        yhat = np.clip(yhat, 0, None)
+        yhat = np.rint(yhat).astype(int)
+
+        test_prefix = re.search(r"(TEST_\d+)", os.path.basename(path)).group(1)
+        pred_dates = [f"{test_prefix}+{i+1}일" for i in range(cfg.HORIZON)]  # 【참고】LSTM과 동일 규칙【turn16file2†lstm.py†L40-L46】
+
+        for step, d in enumerate(pred_dates):
+            for j, col in enumerate(item_names):
+                results_long.append({"영업일자": d, "영업장명_메뉴명": col, "매출수량": int(yhat[step, j])})
+
+    pred_long_df = pd.DataFrame(results_long)
+    if pred_long_df.empty:
+        raise RuntimeError("No predictions produced. Check test files and sequence lengths.")
+
+    # --- Merge to submission & save ---
+    submission = _to_submission_format(pred_long_df, cfg.SAMPLE_SUBMISSION)
+    param_tag = _param_tag(cfg)
+    out_name = f"submission_fedformer_{param_tag}.csv"
+    out_path = os.path.join(cfg.RESULTS_DIR, out_name)
     os.makedirs(cfg.RESULTS_DIR, exist_ok=True)
-    final_df.to_csv(cfg.SUBMISSION_FILE, index=False, encoding="utf-8-sig")
-    print(f"Saved merged submission to {cfg.SUBMISSION_FILE}")
+    submission.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"[ok] submission saved → {out_path}")
 
+    # optional: experiment_summary (same as LSTM)
+    summary_path = os.path.join(cfg.RESULTS_DIR, "experiment_summary.csv")
+    row = [datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "fedformer", param_tag, ""]
+    import csv
+    if not os.path.exists(summary_path):
+        with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(["타임스탬프", "모델명", "파라미터", "점수"])
+            csv.writer(f).writerow(row)
+    else:
+        with open(summary_path, "a", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(row)
 
 if __name__ == "__main__":
-    predict()
+    main()

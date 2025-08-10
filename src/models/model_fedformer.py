@@ -97,8 +97,13 @@ class FedformerModel(BaseModel):
         } → returns (B, horizon, N)
         """
         x_enc = batch["x_enc"]
-        x_mark_enc = batch["x_mark_enc"]
-        y_mark_dec = batch["y_mark_dec"]
+        x_mark_enc = batch.get("x_mark_enc", batch.get("x_mark"))
+        y_mark_dec = batch.get("y_mark_dec", batch.get("y_mark"))
+        # --- dtype을 x_enc와 강제로 맞춰 안전성 확보 ---
+        if x_mark_enc.dtype != x_enc.dtype:
+            x_mark_enc = x_mark_enc.to(x_enc.dtype)
+        if y_mark_dec.dtype != x_enc.dtype:
+            y_mark_dec = y_mark_dec.to(x_enc.dtype)
 
         # 시간 피처 차원 자동 정합
         x_mark_enc, y_mark_dec = self._slice_time_marks(x_mark_enc, y_mark_dec)

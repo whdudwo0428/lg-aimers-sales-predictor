@@ -121,5 +121,12 @@ pip install -r models/FEDformer/requirements.txt
 
 # 학습 실행
 python -m src.train_fedformer
+
+# 기본(가장 최근 fedformer_*.ckpt 자동 조회)
+python -m src.predict_fedformer
+
+# 특정 ckpt 명시
+python -m src.predict_fedformer --ckpt "results/checkpoints/fedformer_d128_L2_seq28_h7_bs32_lr0.001.ckpt"
+
 ```
 
