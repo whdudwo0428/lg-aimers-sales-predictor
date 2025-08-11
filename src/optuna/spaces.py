@@ -85,5 +85,4 @@ def suggest(trial: optuna.trial.Trial, model: str, base_cfg) -> Dict[str, Any]:
         o["patchtst.stride"]   = stride
         return o
 
-
     return o

@@ -12,87 +12,97 @@ import torch.nn as nn
 from .base_model import BaseModel
 
 def _safe_modes_cap(cfg) -> int:
-    """enc/dec에서 실제 FFT 축 길이를 고려해 modes 상한을 계산"""
-    enc_nfreq = max(1, int(cfg.SEQ_LEN) // 2)
+    # enc/dec의 rFFT 축 길이 = L//2 + 1
+    enc_nfreq = max(1, int(cfg.SEQ_LEN) // 2 + 1)
     dec_len = int(cfg.LABEL_LEN) + int(cfg.HORIZON)
-    dec_nfreq = max(1, dec_len // 2)
+    dec_nfreq = max(1, dec_len // 2 + 1)
     return min(enc_nfreq, dec_nfreq)
 
 def _clamp_fourier_modes_recursively(module, cap: int) -> None:
-    """
-    FEDformer 서브모듈 전체를 순회하며
-    - modes1/modes2를 cap 이하로 줄이고
-    - index_q/index_kv 길이도 modes 및 weights의 모드 차원과 cap에 맞춰 잘라 일치시킨다.
-    """
-
     def _to_list(x):
-        if x is None:
-            return None
-        if isinstance(x, list):
-            return x
-        if isinstance(x, tuple):
-            return list(x)
-        # torch.Tensor or numpy or other iterables
+        if x is None: return None
+        if hasattr(x, "tolist"):
+            try:
+                lst = x.tolist()
+                return [int(v) for v in (lst if isinstance(lst, list) else [lst])]
+            except Exception:
+                pass
+        if isinstance(x, (list, tuple)):
+            try:
+                return [int(getattr(v, "item", lambda: v)()) for v in x]
+            except Exception:
+                return [int(v) for v in x]
         try:
             return [int(v) for v in list(x)]
         except Exception:
             return None
 
+    def _trim_values(idx, bound: int, fallback_len: int | None):
+        li = _to_list(idx)
+        if li is None:
+            return None
+        # 값 자체를 0 <= v < bound 로 필터링
+        li = [v for v in li if 0 <= v < int(bound)]
+        if (fallback_len is not None) and len(li) == 0 and int(fallback_len) > 0:
+            li = list(range(int(fallback_len)))
+        return li
+
     for m in module.modules():
-        # 1) modes를 cap으로 제한
-        if hasattr(m, "modes1"):
-            try:
-                m.modes1 = int(min(int(m.modes1), int(cap)))
-            except Exception:
-                pass
-        if hasattr(m, "modes2"):
-            try:
-                m.modes2 = int(min(int(m.modes2), int(cap)))
-            except Exception:
-                pass
+        # 1) modes 상한
+        for name in ("modes", "modes1", "modes2"):
+            if hasattr(m, name):
+                try:
+                    setattr(m, name, int(min(int(getattr(m, name)), int(cap))))
+                except Exception:
+                    pass
 
-        # 2) 해당 모듈이 가진 weight 파라미터의 모드 차원 확인
-        w1_lim = None  # 보통 kv 쪽 모드 차원
-        w2_lim = None  # 보통 q 쪽 모드 차원
+        # 2) weights 모드 차원
+        w1_lim = None
+        w2_lim = None
         if hasattr(m, "weights1") and getattr(m, "weights1") is not None:
-            try:
-                w1_lim = int(getattr(m, "weights1").shape[-1])
-            except Exception:
-                w1_lim = None
+            try: w1_lim = int(getattr(m, "weights1").shape[-1])
+            except Exception: pass
         if hasattr(m, "weights2") and getattr(m, "weights2") is not None:
-            try:
-                w2_lim = int(getattr(m, "weights2").shape[-1])
-            except Exception:
-                w2_lim = None
+            try: w2_lim = int(getattr(m, "weights2").shape[-1])
+            except Exception: pass
 
-        # 3) 인덱스 배열을 cap/modes/weights 한계 내로 자르는 헬퍼
-        def _trim_indices(idx, max_len):
-            idx = _to_list(idx)
-            if idx is None:
-                return None
-            # 음수/초과 index 제거, cap 범위 내로
-            idx = [int(v) for v in idx if 0 <= int(v) < int(cap)]
-            # 길이를 모드 길이에 맞춤
-            if max_len is not None and len(idx) > int(max_len):
-                idx = idx[: int(max_len)]
-            # 비어버리면 간단한 연속 인덱스로 대체(안정성)
-            if (max_len is not None) and int(max_len) > 0 and len(idx) == 0:
-                idx = list(range(int(max_len)))
-            return idx
+        # helper: 경계 결정
+        def _bound(*cands):
+            vals = [int(v) for v in cands if v is not None]
+            return min(vals) if vals else int(cap)
 
-        # 4) index_q 정리 (쿼리 쪽은 보통 modes1, weights2 제한)
+        # 3) self-attn 등 단일 index 처리
+        if hasattr(m, "index"):
+            tgt = _bound(getattr(m, "modes", cap), w1_lim, w2_lim, cap)
+            new_idx = _trim_values(getattr(m, "index"), tgt, tgt)
+            if new_idx is not None:
+                m.index = new_idx
+                try:
+                    m.modes = min(int(getattr(m, "modes", cap)), len(new_idx))
+                except Exception:
+                    pass
+
+        # 4) cross/self - index_q
         if hasattr(m, "index_q"):
-            target_q = int(getattr(m, "modes1", cap))
-            if w2_lim is not None:
-                target_q = min(target_q, int(w2_lim))
-            m.index_q = _trim_indices(getattr(m, "index_q"), target_q)
+            tgt_q = _bound(getattr(m, "modes1", cap), w2_lim, cap)
+            new_q = _trim_values(getattr(m, "index_q"), tgt_q, tgt_q)
+            if new_q is not None:
+                m.index_q = new_q
+                try:
+                    m.modes1 = min(int(getattr(m, "modes1", cap)), len(new_q))
+                except Exception:
+                    pass
 
-        # 5) index_kv 정리 (키/값 쪽은 보통 modes2, weights1 제한)
+        # 5) cross/self - index_kv
         if hasattr(m, "index_kv"):
-            target_kv = int(getattr(m, "modes2", cap))
-            if w1_lim is not None:
-                target_kv = min(target_kv, int(w1_lim))
-            m.index_kv = _trim_indices(getattr(m, "index_kv"), target_kv)
+            tgt_kv = _bound(getattr(m, "modes2", cap), w1_lim, cap)
+            new_kv = _trim_values(getattr(m, "index_kv"), tgt_kv, tgt_kv)
+            if new_kv is not None:
+                m.index_kv = new_kv
+                try:
+                    m.modes2 = min(int(getattr(m, "modes2", cap)), len(new_kv))
+                except Exception:
+                    pass
 
 
 def _import_original_fedformer() -> Any:
@@ -190,6 +200,9 @@ class FedformerModel(BaseModel):
           "y_mark_dec": (B, label_len + horizon, T)
         } → returns (B, horizon, N)
         """
+        # 안전장치: 매 스텝 RFFT 모드/인덱스 재클램프
+        _clamp_fourier_modes_recursively(self._orig, _safe_modes_cap(self._cfg))
+
         x_enc = batch["x_enc"]
         x_mark_enc = batch.get("x_mark_enc", batch.get("x_mark"))
         y_mark_dec = batch.get("y_mark_dec", batch.get("y_mark"))
