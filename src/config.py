@@ -6,6 +6,7 @@ so different environments (macOS MPS / CUDA / CPU) can run with the same code.
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 import os
 
 
@@ -62,6 +63,7 @@ class Config:
     # Optimisation
     # ---------------------------------------------------------------
     LR: float = 1e-3
+    WEIGHT_DECAY: float = 0.0
     WD: float = 1e-4
     PATIENCE: int = 5
 

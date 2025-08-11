@@ -1,146 +1,119 @@
-"""
-PyTorch Lightning module wrapper for training forecasting models.
-
-This module adapts an arbitrary model implementing a ``forward`` method
-to the PyTorch Lightning API.  It handles computing the Weighted
-SMAPE loss, logging metrics and configuring the optimiser and
-learning rate scheduler.  The module expects the input batches to be
-tuples containing four tensors: ``(x_enc, y_seq, x_mark, y_mark)``.
-These correspond to the encoder inputs, decoder targets, encoder
-calendar features and decoder calendar features, respectively.
-"""
-
 from __future__ import annotations
 
 import torch
 import pytorch_lightning as pl
 from typing import Dict, Any, Tuple
+from types import SimpleNamespace
 
 from .loss import weighted_smape_loss
 
 
 class LitModel(pl.LightningModule):
-    """Lightning wrapper that trains a forecasting model using Weighted SMAPE.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The underlying PyTorch model.  Its ``forward`` method must
-        accept a dictionary with keys ``x_enc``, ``x_mark_enc`` and
-        optionally ``y_mark_dec``, and return a tensor of shape
-        ``(B, horizon, N)`` where ``N`` is the number of series.  Any
-        attention weights returned by the model are ignored.
-    cfg : Config
-        Configuration object containing optimisation hyperparameters.
-    item_names : Iterable[str]
-        Names of the series in the order they appear in the data.  Used
-        to construct the per‑item weight vector.
-    device : torch.device or str, optional
-        Desired device.  The weights tensor will be moved to this
-        device.  If omitted the trainer will place the module on the
-        appropriate device.
-    """
-
     def __init__(self, model: torch.nn.Module, cfg: Any, item_names: Any, device: Any = None) -> None:
         super().__init__()
         self.model = model
         self.cfg = cfg
 
-        # Compute weights: 2 for items containing Damha or Miracia, else 1
-        weight_list = []
+        # item별 가중치
+        w = []
         for name in item_names:
-            if ("Damha" in name) or ("Miracia" in name):
-                weight_list.append(2.0)
-            else:
-                weight_list.append(1.0)
-        weight_tensor = torch.tensor(weight_list, dtype=torch.float32)
+            w.append(2.0 if ("Damha" in name or "Miracia" in name) else 1.0)
+        wt = torch.tensor(w, dtype=torch.float32)
         if device is not None:
-            weight_tensor = weight_tensor.to(device)
-        # Register as buffer so that it moves with the model
-        self.register_buffer("weights", weight_tensor)
+            wt = wt.to(device)
+        self.register_buffer("weights", wt)
 
-        # Expose horizon and label length for convenience
         self.horizon = cfg.HORIZON
         self.label_len = cfg.LABEL_LEN
-
-        # Log configuration summary once at the start of training
         self.logged_hyperparams = False
 
-    # ------------------------------------------------------------------
-    # Forward pass
-    # ------------------------------------------------------------------
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Forward pass through the underlying model.
-
-        The model is expected to accept a dictionary containing
-        ``x_enc``, ``x_mark_enc`` and optionally ``y_mark_dec``.  The
-        ``y_mark_dec`` argument may be omitted by models that ignore
-        decoder features.
+    # ------------------------------ 배치 유틸 ------------------------------
+    def _build_x_dec(self, y_seq: torch.Tensor) -> torch.Tensor:
         """
+        디코더 입력 생성:
+        - teacher forcing 없이 일반적으로 label_len 구간(y_seq 앞부분)을 컨텍스트로 주고
+          horizon 길이만큼 0을 붙여 디코더 입력을 만든다.
+        """
+        dec_zeros = torch.zeros_like(y_seq[:, -self.horizon:, :])
+        return torch.cat([y_seq[:, :self.label_len, :], dec_zeros], dim=1)
+
+    def _format_batch(self, batch) -> Dict[str, torch.Tensor]:
+        """
+        다양한 형태의 배치를 표준 딕셔너리로 통일:
+        반환 키: x_enc, x_mark_enc, x_dec, y_mark_dec, y_true
+        """
+        # 1) 이미 dict인 경우
+        if isinstance(batch, dict):
+            b = dict(batch)  # copy
+            # y_true가 없지만 y_seq가 있으면 만들어 준다
+            if "y_true" not in b and "y_seq" in b:
+                b["y_true"] = b["y_seq"][:, -self.horizon:, :]
+            # x_dec이 없고 y_seq가 있으면 생성
+            if "x_dec" not in b and "y_seq" in b:
+                b["x_dec"] = self._build_x_dec(b["y_seq"])
+            return b
+
+        # 2) (dict,) 래핑
+        if isinstance(batch, (tuple, list)) and len(batch) == 1 and isinstance(batch[0], dict):
+            return self._format_batch(batch[0])
+
+        # 3) (x_enc, y_seq, x_mark, y_mark) 튜플
+        if isinstance(batch, (tuple, list)) and len(batch) == 4 and all(torch.is_tensor(t) for t in batch):
+            x_enc, y_seq, x_mark, y_mark = batch
+            return {
+                "x_enc": x_enc,
+                "x_mark_enc": x_mark,
+                "x_dec": self._build_x_dec(y_seq),
+                "y_mark_dec": y_mark,
+                "y_true": y_seq[:, -self.horizon:, :],
+            }
+
+        raise TypeError(f"Unsupported batch type for formatting: {type(batch)}")
+
+    def format_batch(self, batch) -> Dict[str, torch.Tensor]:
+        return self._format_batch(batch)
+
+    # ------------------------------ forward ------------------------------
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # 모델은 dict를 그대로 받도록 통일 (FEDformer/Autoformer/PatchTST 래퍼가 키를 읽음)
         return self.model(batch)
 
-    # ------------------------------------------------------------------
-    # Training/validation/test steps
-    # ------------------------------------------------------------------
-    def _shared_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], stage: str) -> torch.Tensor:
-        # Unpack the tuple produced by the DataLoader
-        x_enc, y_seq, x_mark, y_mark = batch
-        # Construct the decoder context and true values
-        # y_seq has shape (B, label_len + horizon, N)
-        # The model receives the decoder context (label_len timesteps) via y_mark
-        batch_dict = {
-            "x_enc": x_enc,
-            "x_mark_enc": x_mark,
-            "y_mark_dec": y_mark,
-        }
-        # Forward pass returns predictions of shape (B, horizon, N)
-        pred = self(batch_dict)
-        # Extract the ground truth horizon portion from y_seq
-        true = y_seq[:, -self.horizon :, :]
-        # Compute Weighted SMAPE
+    # ------------------------- train/val/test step ------------------------
+    def _shared_step(self, batch, stage: str) -> torch.Tensor:
+        b = self._format_batch(batch)
+        pred = self(b)
+        true = b.get("y_true", None)
+        if true is None:
+            raise RuntimeError("y_true is missing in batch after formatting.")
         loss = weighted_smape_loss(pred, true, self.weights)
-        # Logging
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, logger=True)
         return loss
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         if not self.logged_hyperparams:
-            # 문자열은 log 불가 → 숫자만 기록, 디바이스 문자열은 print로만
-            dev = self.device  # Lightning이 보장하는 현재 모듈 디바이스
-            is_cuda = 1 if getattr(dev, "type", None) == "cuda" else 0
-            self.log("is_cuda", is_cuda, prog_bar=False, logger=True)
-            # (선택) 텍스트는 콘솔에만
+            dev = self.device
+            self.log("is_cuda", 1 if getattr(dev, "type", None) == "cuda" else 0, prog_bar=False, logger=True)
             self.print(f"[device] {dev}")
             self.log("seed", self.cfg.SEED, prog_bar=False, logger=True)
             self.logged_hyperparams = True
         return self._shared_step(batch, stage="train")
 
-    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+    def validation_step(self, batch, batch_idx: int) -> None:
         self._shared_step(batch, stage="val")
 
-    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+    def test_step(self, batch, batch_idx: int) -> None:
         self._shared_step(batch, stage="test")
 
-    # ------------------------------------------------------------------
-    # Optimiser configuration
-    # ------------------------------------------------------------------
+    # ------------------------- optimizer/scheduler ------------------------
     def configure_optimizers(self) -> Dict[str, Any]:
-        # Use AdamW as the optimiser
-        optim = torch.optim.AdamW(
-            self.parameters(), lr=self.cfg.LR, weight_decay=self.cfg.WD
-        )
-        # Cosine annealing scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optim, T_max=self.cfg.EPOCHS
-        )
+        lr = float(getattr(self.cfg, "LR", getattr(self.cfg, "LEARNING_RATE", 1e-3)))
+        wd = getattr(self.cfg, "WD", getattr(self.cfg, "WEIGHT_DECAY", 0.0))
+        wd = float(wd)
+
+        optim = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd)
+        epochs = int(getattr(self.cfg, "EPOCHS", 10))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=max(1, epochs))
         return {
             "optimizer": optim,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-                "monitor": "val_loss",
-            },
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "monitor": "val_loss"},
         }
-
-
-__all__ = ["LitModel"]

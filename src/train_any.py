@@ -1,6 +1,7 @@
 # src/train_any.py
 from __future__ import annotations
 import os
+import json, argparse
 from .config import Config
 from .core.feature_engineer import FeatureEngineer
 from .core.data_module import TimeSeriesDataModule
@@ -13,6 +14,17 @@ def train() -> None:
     from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
     cfg = Config()
+    # (옵션) Optuna 결과 덮어쓰기
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--override", type=str, default=None,
+                    help="dot-override JSON 경로 (e.g., results/optuna/fedformer/best_config_overrides.json)")
+    args, _ = ap.parse_known_args()
+    if args.override:
+        from .optuna.utils import apply_overrides
+        with open(args.override, "r", encoding="utf-8") as f:
+            overrides = json.load(f)
+        cfg = apply_overrides(cfg, overrides)
+
     seed_everything(cfg.SEED)
 
     fe = FeatureEngineer(cfg.LAG_PERIODS, cfg.MA_WINDOWS)

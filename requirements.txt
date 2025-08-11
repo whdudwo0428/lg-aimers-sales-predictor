@@ -1,0 +1,15 @@
+torch
+numpy>=1.23
+pandas>=1.5
+scikit-learn>=1.2
+pytorch-lightning>=1.9,<2.3
+torchmetrics>=0.11
+optuna>=3.2
+optuna-integration[pytorch_lightning]>=3.2
+pytorch-lightning>=1.9,<2.3
+tqdm>=4.65
+pyyaml>=6.0
+
+# 로깅/시각화 (선택)
+tensorboard>=2.12
+# lightning[extra] 설치 시 자동 포함되지만, 충돌 피하려면 분리 설치 권장

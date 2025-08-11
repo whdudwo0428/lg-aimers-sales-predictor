@@ -12,47 +12,33 @@
 ## 📂 폴더 구조
 
 ```
-src/
-├── core/                  # 공통 기능 모음
-│   ├── data_loader.py         # CSV 읽기/병합/기본 전처리 함수
-│   ├── data_module.py         # Lightning DataModule + 슬라이딩 윈도우
-│   ├── feature_engineer.py    # Lag, MA, 요일·월·연중일·공휴일 피처
-│   ├── loss.py                # Weighted SMAPE 등 손실 함수
-│   ├── evaluation.py          # SMAPE 등 평가 메트릭
-│   ├── holidays.py            # 공휴일 리스트 정의
-│   └── utils.py               # seed 고정, config 베이스 등 유틸
-│
-├── models/                # 모델별 래퍼와 학습/추론 스크립트
-│   ├── fedformer/
-│   │   ├── model.py           # FedFormer 래퍼 (placeholder)
-│   │   ├── config.py          # FedFormer 하이퍼파라미터 정의
-│   │   ├── train.py           # FedFormer 학습 루프
-│   │   └── predict.py         # FedFormer 추론 & 제출 파일 생성
-│   ├── patchtst/              # PatchTST 래퍼 (placeholder)
-│   │   ├── model.py
-│   │   ├── config.py
-│   │   ├── train.py
-│   │   └── predict.py
-│   ├── timesfm/               # TimesFM 래퍼 (placeholder)
-│   │   ├── model.py
-│   │   ├── config.py
-│   │   ├── train.py
-│   │   └── predict.py
-│   └── autoformer/            # Autoformer 래퍼 (placeholder)
-│       ├── model.py
-│       ├── config.py
-│       ├── train.py
-│       └── predict.py
-│
-├── train_fedformer.py     # 진입점: FedFormer 학습
-├── train_patchtst.py      # 진입점: PatchTST 학습
-├── train_timesfm.py       # 진입점: TimesFM 학습
-├── train_autoformer.py    # 진입점: Autoformer 학습
-├── predict_fedformer.py   # 진입점: FedFormer 예측
-├── predict_patchtst.py    # 진입점: PatchTST 예측
-├── predict_timesfm.py     # 진입점: TimesFM 예측
-├── predict_autoformer.py  # 진입점: Autoformer 예측
-└── evaluate.py            # 간단한 평가/검증 스크립트
+project-root/
+├─ src/
+│  ├─ config.py                 # 공통 설정 (MODEL_NAME 등)
+│  ├─ train_any.py              # 학습 엔트리
+│  ├─ predict_any.py            # 예측 엔트리 (모델 공통)
+│  ├─ core/                     # DataModule, LightningModule, utils, feature_engineer, holidays ...
+│  ├─ models/                   # 래퍼들 + 외부 원본 라이브러리(models/FEDformer, Autoformer, PatchTST ...)
+│  └─ optuna/
+│     ├─ runner.py              # Optuna 실행 엔트리(튜닝 스터디 생성/재개/저장)
+│     ├─ objective.py           # “학습 1회”를 수행하는 objective
+│     ├─ spaces.py              # 모델별 탐색공간 정의(넓게, 조건부 포함)
+│     └─ utils.py               # 설정 오버라이드/리소스 정리/저장 헬퍼
+├─ dataset/
+│  ├─ train.csv
+│  ├─ test/TEST_*.csv           # 테스트 분할들
+│  └─ sample_submission.csv
+├─ results/
+│  ├─ checkpoints/              # 학습 시 자동 저장되는 ckpt
+│  ├─ optuna/<model>/           # 튠 결과(best_params.json, trials.csv 등)
+│  └─ submission_*.csv          # 예측 산출물
+├─ models/                      # 깃허브 원본 배치(폴더 이름/위치 유지)
+│  ├─ FEDformer/...
+│  ├─ Autoformer/...
+│  └─ PatchTST/...
+├─ requirements.txt             # 의존성 명세(아래 참조)
+└─ README.md                    # (이 문서)
+
 ```
 
 ## 🔧 사용 방법
@@ -104,40 +90,53 @@ python -m src.predict_fedformer
 
 ---
 ```
-# 프로젝트 루트
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+# 1) 가상환경 만들고 필수 설치
+python -m venv .venv && source .venv/bin/activate         # (Windows: .venv\Scripts\Activate.ps1)
+pip install -U pip wheel setuptools
+pip install -r requirements.txt
 
-# 공통 의존성
-pip install -U pip wheel
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # GPU일 때; CPU면 일반 pip install torch ...
-pip install pytorch-lightning pandas numpy scikit-learn tqdm optuna
+# 2) (CUDA) GPU용 PyTorch 설치 — 예시(CUDA 12.x)
+# Windows/Linux 공통: 본인 CUDA 버전에 맞춰 torch/torchvision/torchaudio 설치
+pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
 
-# FEDformer 원본이 요구하는 추가 패키지(필요 시)
-pip install -r models/FEDformer/requirements.txt
-
-# 학습 실행
-python -m src.train_fedformer
-
-# 기본(가장 최근 fedformer_*.ckpt 자동 조회)
-python -m src.predict_fedformer
-
-# 특정 ckpt 명시
-python -m src.predict_fedformer --ckpt "results/checkpoints/fedformer_d128_L2_seq28_h7_bs32_lr0.001.ckpt"
-
----
-# 공통 훈련모델 train_any 사용법
-# config에서 MODEL_NAME = ~ 선택 후
+# 3) 학습 (Config.MODEL_NAME으로 모델 선택)
 python -m src.train_any
 
-# 공통 예측모델 predict_any 사용법
-python -m src.predict_any --model autoformer
-python -m src.predict_any --model patchtst
+---
+# 확인용 3순회 옵튜나 
+mkdir -p results/optuna/fedformer_quick
+python -m src.optuna.runner \
+  --model fedformer \
+  --trials 3 \
+  --storage sqlite:///$PWD/results/optuna/fedformer_quick/study.sqlite3 \
+  --study-name optuna_fedformer_quick
 
-# 특정 ckpt 지정:
-python -m src.predict_any --model fedformer --ckpt results/checkpoints/fedformer_....ckpt   
+
+# 4) 튠(학습과 동시에 Optuna)
+python -m src.optuna.runner \
+  --model fedformer \
+  --trials 100 \
+  --storage sqlite:///$PWD/results/optuna/fedformer/study.sqlite3 \
+  --study-name optuna_fedformer
+
+python -m src.optuna.runner \
+  --model autoformer \
+  --trials 100 \
+  --storage sqlite:///$PWD/results/optuna/autoformer/study.sqlite3 \
+  --study-name optuna_autoformer
+
+python -m src.optuna.runner \
+  --model patchtst \
+  --trials 100 \
+  --storage sqlite:///$PWD/results/optuna/patchtst/study.sqlite3 \
+  --study-name optuna_patchtst
+
+
+# 5) 베스트 파라미터로 재학습(긴 에폭)
+python -m src.train_any --override results/optuna/fedformer/best_config_overrides.json
+
+# 6) 예측 CSV 생성
+python -m src.predict_any --model fedformer
+
 ```
 

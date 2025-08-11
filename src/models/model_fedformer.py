@@ -11,6 +11,89 @@ import torch.nn as nn
 
 from .base_model import BaseModel
 
+def _safe_modes_cap(cfg) -> int:
+    """enc/dec에서 실제 FFT 축 길이를 고려해 modes 상한을 계산"""
+    enc_nfreq = max(1, int(cfg.SEQ_LEN) // 2)
+    dec_len = int(cfg.LABEL_LEN) + int(cfg.HORIZON)
+    dec_nfreq = max(1, dec_len // 2)
+    return min(enc_nfreq, dec_nfreq)
+
+def _clamp_fourier_modes_recursively(module, cap: int) -> None:
+    """
+    FEDformer 서브모듈 전체를 순회하며
+    - modes1/modes2를 cap 이하로 줄이고
+    - index_q/index_kv 길이도 modes 및 weights의 모드 차원과 cap에 맞춰 잘라 일치시킨다.
+    """
+
+    def _to_list(x):
+        if x is None:
+            return None
+        if isinstance(x, list):
+            return x
+        if isinstance(x, tuple):
+            return list(x)
+        # torch.Tensor or numpy or other iterables
+        try:
+            return [int(v) for v in list(x)]
+        except Exception:
+            return None
+
+    for m in module.modules():
+        # 1) modes를 cap으로 제한
+        if hasattr(m, "modes1"):
+            try:
+                m.modes1 = int(min(int(m.modes1), int(cap)))
+            except Exception:
+                pass
+        if hasattr(m, "modes2"):
+            try:
+                m.modes2 = int(min(int(m.modes2), int(cap)))
+            except Exception:
+                pass
+
+        # 2) 해당 모듈이 가진 weight 파라미터의 모드 차원 확인
+        w1_lim = None  # 보통 kv 쪽 모드 차원
+        w2_lim = None  # 보통 q 쪽 모드 차원
+        if hasattr(m, "weights1") and getattr(m, "weights1") is not None:
+            try:
+                w1_lim = int(getattr(m, "weights1").shape[-1])
+            except Exception:
+                w1_lim = None
+        if hasattr(m, "weights2") and getattr(m, "weights2") is not None:
+            try:
+                w2_lim = int(getattr(m, "weights2").shape[-1])
+            except Exception:
+                w2_lim = None
+
+        # 3) 인덱스 배열을 cap/modes/weights 한계 내로 자르는 헬퍼
+        def _trim_indices(idx, max_len):
+            idx = _to_list(idx)
+            if idx is None:
+                return None
+            # 음수/초과 index 제거, cap 범위 내로
+            idx = [int(v) for v in idx if 0 <= int(v) < int(cap)]
+            # 길이를 모드 길이에 맞춤
+            if max_len is not None and len(idx) > int(max_len):
+                idx = idx[: int(max_len)]
+            # 비어버리면 간단한 연속 인덱스로 대체(안정성)
+            if (max_len is not None) and int(max_len) > 0 and len(idx) == 0:
+                idx = list(range(int(max_len)))
+            return idx
+
+        # 4) index_q 정리 (쿼리 쪽은 보통 modes1, weights2 제한)
+        if hasattr(m, "index_q"):
+            target_q = int(getattr(m, "modes1", cap))
+            if w2_lim is not None:
+                target_q = min(target_q, int(w2_lim))
+            m.index_q = _trim_indices(getattr(m, "index_q"), target_q)
+
+        # 5) index_kv 정리 (키/값 쪽은 보통 modes2, weights1 제한)
+        if hasattr(m, "index_kv"):
+            target_kv = int(getattr(m, "modes2", cap))
+            if w1_lim is not None:
+                target_kv = min(target_kv, int(w1_lim))
+            m.index_kv = _trim_indices(getattr(m, "index_kv"), target_kv)
+
 
 def _import_original_fedformer() -> Any:
     """
@@ -43,8 +126,16 @@ def _import_original_fedformer() -> Any:
 
 
 def _build_original_cfg(cfg: Any, input_dim: int) -> SimpleNamespace:
-    """Map our Config to the attributes expected by the original constructor."""
     F = cfg.FEDformer
+
+    # enc/dec가 허용하는 최대 푸리에 모드 수
+    enc_nfreq = max(1, cfg.SEQ_LEN // 2)
+    dec_len = int(cfg.LABEL_LEN + cfg.HORIZON)
+    dec_nfreq = max(1, dec_len // 2)
+
+    wanted_modes = int(getattr(F, "MODES", 32))
+    safe_modes = max(1, min(wanted_modes, enc_nfreq, dec_nfreq))  # ✅ 안전 클램프
+
     return SimpleNamespace(
         # sequence lengths
         seq_len=cfg.SEQ_LEN, label_len=cfg.LABEL_LEN, pred_len=cfg.HORIZON,
@@ -53,22 +144,22 @@ def _build_original_cfg(cfg: Any, input_dim: int) -> SimpleNamespace:
         # model size
         d_model=F.D_MODEL, n_heads=F.N_HEADS, d_ff=F.D_FF,
         e_layers=F.E_LAYERS, d_layers=F.D_LAYERS, dropout=F.DROPOUT,
-        # time features / embedding
+        # embed/time
         embed=F.EMBED, freq=F.FREQ,
-        # variants / attention
+        # attention variants
         version=getattr(F, "VERSION", "Fourier"),
         mode_select=getattr(F, "MODE_SELECT", "random"),
-        modes=getattr(F, "MODES", 32),
+        modes=safe_modes,                 # ✅ 여기 안전값 적용
         moving_avg=getattr(F, "MOVING_AVG", 25),
         factor=getattr(F, "FACTOR", 1),
-        # wavelet extras (for completeness)
+        # extras
         L=getattr(F, "L", 1),
         base=getattr(F, "BASE", "legendre"),
         cross_activation=getattr(F, "CROSS_ACTIVATION", "tanh"),
-        # misc
         activation=F.ACTIVATION,
         output_attention=getattr(F, "OUTPUT_ATTENTION", False),
     )
+
 
 
 class FedformerModel(BaseModel):
@@ -86,6 +177,9 @@ class FedformerModel(BaseModel):
         Original = _import_original_fedformer()
         orig_cfg = _build_original_cfg(cfg, input_dim)
         original_model = Original(orig_cfg)
+
+        _clamp_fourier_modes_recursively(original_model, _safe_modes_cap(cfg))
+
         return cls(original_model, cfg)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
