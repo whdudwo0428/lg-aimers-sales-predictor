@@ -1,10 +1,9 @@
 # ----------  # <CELL: imports & device>
-import os, glob, pickle
+import os, pickle
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import LabelEncoder
-import holidays
 
 from transformers import (
     PatchTSTConfig, PatchTSTForPrediction,
@@ -28,9 +27,16 @@ print("DEVICE:", DEVICE)
 
 # ----------  # <CELL: global configs & paths>
 CONTEXT_LEN = 28
+
+CONTEXT_SET = [28, 56, 84]
+def ctx_save_dir(ctx: int) -> str:
+    d = os.path.join(SAVE_DIR, f"ctx_{ctx}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
 PRED_LEN    = 7
 PATCH_LEN   = 7
-PATCH_STRIDE= 7         # 7 / 1
+PATCH_STRIDE= 1       # 7 / 1
 DATA_STRIDE = 1
 
 K_FOLDS = 5
@@ -64,19 +70,17 @@ def find_test_files():
 
 CAP_MULT = 1.4                 # 상한 여유 배수
 ENSEMBLE_NAIVE_W = 0.35  # 모델:(1-α)=0.50, 나이브:α=0.50  (권장 탐색 0.2~0.5)
-SUBMISSION_ROUND_INT = True    # 규정이 정수 필수면 True 유지
-SMALL_VALUE_CUTOFF  = 0.0      # 0.9 등으로 두면 그 미만은 0 강제
 FOLD_ENSEMBLE = True           # 폴드 앙상블 추론 활성화
 
 # Loss 가중치(원-스케일 sMAPE 중심 + log-MAE 보강 + 0-overshoot 패널티)
 SPLIT_OBJECTIVE = "SMAPE"   # 기존 LEADERBOARD_OBJECTIVE와 의미 동일
-SMAPE_WEIGHT    = 0.7
+SMAPE_WEIGHT    = 0.85
 MAE_WEIGHT      = 0.0       # zero-heavy 데이터면 원-MAE 비중은 낮추는 게 sMAPE에 유리
-LOG_MAE_WEIGHT  = 0.3       # log-space 안정화(저수량/제로 근처 진동 억제)
+LOG_MAE_WEIGHT  = 0.12       # log-space 안정화(저수량/제로 근처 진동 억제)
 SMAPE_EPS       = 1e-6      # sMAPE 분모 안정화용(원한다면 1e-5~1e-4로 상향 테스트)
 
 # y_true==0일 때 양수 예측(overshoot)에 대한 별도 패널티(작게라도 양수 찍는 습성 억제)
-ZERO_OVERSHOOT_PENALTY = 0.25   # λ_zero (0.15~0.5 권장 범위)
+ZERO_OVERSHOOT_PENALTY = 0.04   # λ_zero (0.15~0.5 권장 범위)
 
 # EarlyStopping 공통 설정(이미 쓰셨다면 그대로 두셔도 됩니다)
 EARLY_STOP_PATIENCE = 6  # CV/Final 모두 동일하게 사용
@@ -84,7 +88,7 @@ EARLY_STOP_PATIENCE = 6  # CV/Final 모두 동일하게 사용
 # 추론 단계(리더보드 직결) 안전장치
 USE_INT_ROUND      = False   # 제출이 정수 필수 아니라고 하셨으므로 기본 False 권장
 CUT_THRESHOLD      = None    # 이하면 0으로 컷(0.7~1.0 사이 탐색)
-ZERO_RUN_GUARD_DAYS= 14      # 직전 K일 합이 0이면 미래 7일 전부 0 강제
+ZERO_RUN_GUARD_DAYS= 0      # 직전 K일 합이 0이면 미래 7일 전부 0 강제
 
 # ----------  # <CELL: io & features>
 
@@ -99,6 +103,21 @@ def load_train_df():
     s = df["영업장명_메뉴명"].astype(str).str.split("_", n=1, expand=True)
     df["store_name"] = s[0]; df["menu_name"] = s[1]
     df["store_menu"] = df["store_name"] + "_" + df["menu_name"]
+    return df
+
+def add_rolling_channels(df: pd.DataFrame, group_col="store_menu") -> pd.DataFrame:
+    df = df.sort_values([group_col,"date"]).copy()
+    def _per_group(g):
+        s = pd.to_numeric(g["매출수량"], errors="coerce").fillna(0.0)
+        # 미래 누수 방지: shift(1) 후 rolling
+        g["roll7_mean"]   = s.shift(1).rolling(7,  min_periods=1).mean()
+        g["roll28_mean"]  = s.shift(1).rolling(28, min_periods=1).mean()
+        g["roll7_med"]    = s.shift(1).rolling(7,  min_periods=1).median()
+        g["nzrate28"]     = (s.shift(1) > 0).astype(float).rolling(28, min_periods=1).mean()
+        return g
+    df = df.groupby(group_col, group_keys=False).apply(_per_group)
+    for c in ["roll7_mean","roll28_mean","roll7_med","nzrate28"]:
+        df[c] = df[c].fillna(0.0).astype(float)
     return df
 
 def fit_or_load_label_encoder(series: pd.Series) -> LabelEncoder:
@@ -118,22 +137,46 @@ def fit_or_load_label_encoder(series: pd.Series) -> LabelEncoder:
     return le
 
 from holidays import country_holidays
+from datetime import timedelta
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()  # 원본 보존
+    df = df.copy()
     df["weekday"] = df["date"].dt.dayofweek
     df["is_weekend"] = df["weekday"].isin([5, 6]).astype(int)
     df["month"] = df["date"].dt.month
     df["is_ski_season"] = df["month"].isin([12, 1, 2]).astype(int)
 
     years = sorted(df["date"].dt.year.unique().tolist())
-    kr = set(country_holidays("KR", years=years))  # membership 검사 빠르게
+    kr = set(country_holidays("KR", years=years))
     df["is_holiday"] = df["date"].dt.date.map(lambda d: int(d in kr)).astype(int)
 
     df["weekday_sin"] = np.sin(2 * np.pi * df["weekday"] / 7.0)
     df["weekday_cos"] = np.cos(2 * np.pi * df["weekday"] / 7.0)
     df["month_sin"]   = np.sin(2 * np.pi * (df["month"] - 1) / 12.0)
     df["month_cos"]   = np.cos(2 * np.pi * (df["month"] - 1) / 12.0)
+
+    # ---- 추가 캘린더 피처 ----
+    df["day"]        = df["date"].dt.day
+    df["weekofyear"] = df["date"].dt.isocalendar().week.astype(int)
+
+    df["day_sin"]  = np.sin(2*np.pi*(df["day"]-1)/31.0)
+    df["day_cos"]  = np.cos(2*np.pi*(df["day"]-1)/31.0)
+    df["weekofyear_sin"] = np.sin(2*np.pi*(df["weekofyear"]-1)/53.0)
+    df["weekofyear_cos"] = np.cos(2*np.pi*(df["weekofyear"]-1)/53.0)
+
+    df["is_month_start"]   = df["date"].dt.is_month_start.astype(int)
+    df["is_month_end"]     = df["date"].dt.is_month_end.astype(int)
+    df["is_quarter_start"] = df["date"].dt.is_quarter_start.astype(int)
+    df["is_quarter_end"]   = df["date"].dt.is_quarter_end.astype(int)
+
+    # 휴일 전/후 ±1, ±2일 플래그 (위에서 만든 kr 그대로 사용)
+    df["pre_holiday_1"]  = df["date"].dt.date.map(lambda d: int((d + timedelta(days=1)) in kr)).astype(int)
+    df["post_holiday_1"] = df["date"].dt.date.map(lambda d: int((d - timedelta(days=1)) in kr)).astype(int)
+    df["pre_holiday_2"]  = df["date"].dt.date.map(lambda d: int((d + timedelta(days=2)) in kr)).astype(int)
+    df["post_holiday_2"] = df["date"].dt.date.map(lambda d: int((d - timedelta(days=2)) in kr)).astype(int)
+
+
+
     return df
 
 
@@ -271,13 +314,74 @@ def _naive_same_dow(g: pd.DataFrame) -> np.ndarray:
     return mean_dow.astype(float)
 
 def _blend_with_naive(yhat: np.ndarray, g: pd.DataFrame, alpha: float | None = None) -> np.ndarray:
-    """모델 예측 yhat(7,)과 '최근 7일 그대로' 나이브를 섞는다."""
-    a = ENSEMBLE_NAIVE_W if alpha is None else float(alpha)
-    naive = g["sales"].astype(float).tail(PRED_LEN).to_numpy()
-    if naive.shape[0] < PRED_LEN:
-        naive = np.pad(naive, (PRED_LEN - naive.shape[0], 0), constant_values=0.0)
+    base_a = ENSEMBLE_NAIVE_W if alpha is None else float(alpha)
+
+    v = pd.to_numeric(g["매출수량"], errors="coerce").fillna(0.0).to_numpy()
+    v28 = v[-28:] if v.size >= 28 else v
+    nz28 = float((v28 > 0).mean()) if v28.size else 0.0  # 최근 28일 비제로율
+
+    # 주간성 강도 (요일별 평균 분산 / 전체 분산)
+    try:
+        dow = g["weekday"].to_numpy()[-len(v28):]
+        if v28.size >= 14 and np.var(v28) > 0:
+            dow_means = [v28[dow == d].mean() for d in range(7) if (dow == d).any()]
+            weekly_strength = float(np.var(dow_means) / (np.var(v28) + 1e-9)) if len(dow_means) >= 2 else 0.0
+        else:
+            weekly_strength = 0.0
+    except Exception:
+        weekly_strength = 0.0
+
+    a = base_a * np.clip(weekly_strength, 0.0, 1.0) * (0.5 + 0.5 * nz28)
+    a = float(np.clip(a, 0.0, base_a))  # 상한: base_a
+
+    n1 = _naive_last7(g)
+    n2 = _naive_same_dow(g)
+    naive = 0.5 * n1 + 0.5 * n2
     return (1.0 - a) * yhat + a * naive
 
+def _weekly_strength_and_nz(g: pd.DataFrame) -> tuple[float, float]:
+    """요일성 강도(0~1 근사)와 최근 28일 비제로율"""
+    v = pd.to_numeric(g["매출수량"], errors="coerce").fillna(0.0).to_numpy()
+    n = v.size
+    v28 = v[-28:] if n >= 28 else v
+    nz28 = float((v28 > 0).mean()) if v28.size else 0.0
+
+    try:
+        dow = g["weekday"].to_numpy()[-len(v28):]
+        if v28.size >= 14 and np.var(v28) > 0:
+            means = [v28[dow == d].mean() for d in range(7) if (dow == d).any()]
+            weekly_strength = float(np.var(means) / (np.var(v28) + 1e-9)) if len(means) >= 2 else 0.0
+        else:
+            weekly_strength = 0.0
+    except Exception:
+        weekly_strength = 0.0
+
+    return float(np.clip(weekly_strength, 0.0, 1.0)), nz28
+
+def _context_mix_weights(g: pd.DataFrame, contexts: list[int]) -> dict[int, float]:
+    """
+    컨텍스트별 기본 가중 + (요일성/희소성) 보정.
+    • 기본: {28:0.35, 56:0.40, 84:0.25} (없는 ctx는 자동 정규화)
+    • 요일성↑ → 긴 컨텍스트(84/56)에 +, 짧은(28)에 -
+    • 비제로율↓(희소) → 짧은(28)에 +, 긴(84)에 -
+    """
+    base = {28: 0.35, 56: 0.40, 84: 0.25}
+    w = np.array([base.get(c, 0.0) for c in contexts], dtype=float)
+    if w.sum() <= 0:
+        w = np.ones(len(contexts), dtype=float) / len(contexts)
+
+    weekly_strength, nz28 = _weekly_strength_and_nz(g)
+    # 보정폭
+    adj_w = np.zeros_like(w)
+    for i, c in enumerate(contexts):
+        # 요일성: 긴 컨텍스트에 가산, 짧은 컨텍스트에 감산
+        adj_w[i] += ( 0.15 * weekly_strength) * (1 if c >= 56 else -1)
+        # 희소 시계열(nz 낮음): 짧은 컨텍스트에 가산, 긴 컨텍스트에 감산
+        adj_w[i] += ( 0.10 * (1.0 - nz28))   * (1 if c == 28 else (-1 if c >= 84 else 0))
+
+    w = np.clip(w + adj_w, 1e-6, None)
+    w = (w / w.sum()).astype(float)
+    return {c: float(w[i]) for i, c in enumerate(contexts)}
 
 def _zero_run_guard(g: pd.DataFrame, yhat: np.ndarray) -> np.ndarray:
     """최근 ZERO_RUN_GUARD_DAYS가 전부 0이면 미래 7일 0으로 가드."""
@@ -295,9 +399,14 @@ DEBUG_DATASET_SIG = False
 ID_COLS = ["store_menu_id"]
 TIME_COL = "date"
 TARGET_COLS = ["sales_log"]
+# KNOWN_REAL_COLS 확장
 KNOWN_REAL_COLS = [
     "is_holiday", "is_weekend", "is_ski_season",
     "weekday_sin", "weekday_cos", "month_sin", "month_cos",
+    "day_sin","day_cos","weekofyear_sin","weekofyear_cos",
+    "is_month_start","is_month_end","is_quarter_start","is_quarter_end",
+    "pre_holiday_1","post_holiday_1","pre_holiday_2","post_holiday_2",
+    "roll7_mean","roll28_mean","roll7_med","nzrate28",
 ]
 
 def build_dataset(
@@ -318,10 +427,6 @@ def build_dataset(
     sig = inspect.signature(ForecastDFDataset.__init__)
     params = set(sig.parameters.keys())
     kwargs = {}
-
-    CTX = int(context_len) if context_len is not None else int(CONTEXT_LEN)
-    PRED = int(prediction_len) if prediction_len is not None else int(PRED_LEN)
-
     # 길이들
     if "context_length" in params:
         kwargs["context_length"] = context_len
@@ -357,12 +462,12 @@ def build_dataset(
     # 동적 실수 피처 (채널 수를 바꿔야 할 때 여기로 제어)
     if "observable_columns" in params:
         kwargs["observable_columns"] = known_real_cols
-    else:
-        for alt in ["control_columns", "conditional_columns", "categorical_columns"]:
-            if alt in params:
-                kwargs[alt] = known_real_cols
-                break
+    elif "control_columns" in params:
+        kwargs["control_columns"] = known_real_cols
+    elif "conditional_columns" in params:
+        kwargs["conditional_columns"] = known_real_cols
 
+    # 정적 범주 피처로 store_id 주입 (지원되는 파라미터 명에만 넣기)
     if "static_categorical_columns" in params:
         kwargs["static_categorical_columns"] = ["store_id"]
     elif "static_features" in params:  # 혹시 다른 이름을 쓰는 버전 대비
@@ -442,20 +547,8 @@ def _smape_torch(y_true, y_pred, eps=SMAPE_EPS):
     den = (torch.abs(y_true) + torch.abs(y_pred)).clamp_min(eps)
     return 2.0 * (num / den)
 
-def _log_mae_torch(y_true_log, y_pred_log):
-    # 로그 공간 MAE: 저수량/제로 근처에서 안정화
-    return torch.abs(y_pred_log - y_true_log)
-
-def _zero_overshoot_penalty_torch(y_true, y_pred):
-    # y_true==0에서 양수 예측 자체에 선형 패널티 (너무 강하지 않게 평균)
-    mask = (y_true <= 1e-9).float()
-    return (mask * y_pred.clamp(min=0.0)).mean()
-
 def _mae_torch(y_true, y_pred):
     return torch.abs(y_pred - y_true)
-
-def _reduce_mean(x):
-    return torch.mean(x)
 
 def _choose_loss_weights(obj: str):
     # -> 기존 함수 확장: w_logmae, w_zero 추가
@@ -491,10 +584,9 @@ class PatchTSTSalesOnly(nn.Module):
         self.loss_w = _choose_loss_weights(objective)
 
         # 가중 파라미터
-        self.w_zero = 1.10  # ← 1.25 에서 낮춤 (0 쏠림 약화)
-        self.w_all0w = 1.00
-        self.w_logmae = 0.03  # ← 0.30 → 0.03 (로그 MAE 과대 억제)
-        self.w_ovr = 0.02  # ← 0.25 → 0.02 (0에서 양수 예측 과벌점 제거)
+        self.w_zero  = 1.05   # y_true==0 구간 샘플 가중 (과가중 완화)
+        self.w_all0w = 1.00   # 윈도우 전체가 0일 때 가중
+
         self.special_store_ids = set(special_store_ids or [])
 
     def _filter_and_bridge(self, batch: dict):
@@ -520,8 +612,14 @@ class PatchTSTSalesOnly(nn.Module):
 
         pred = getattr(out, "prediction", None)
         if pred is not None and pred.dim() == 3:
-            try: pred = pred[:, self.target_ch, :]
-            except Exception: pass
+            if pred.shape[1] == self.base.config.prediction_length:
+                # (B, L, C) -> select channel
+                ch = min(self.target_ch, pred.shape[2]-1)
+                pred = pred[:, :, ch]
+            else:
+                # (B, C, L)
+                ch = min(self.target_ch, pred.shape[1]-1)
+                pred = pred[:, ch, :]
 
         labels = cleaned.get("labels", None)
         if pred is not None and labels is not None:
@@ -544,7 +642,7 @@ class PatchTSTSalesOnly(nn.Module):
                 scf = batch.get("static_features", None)  # 일부 구현체 호환
 
             if scf is not None:
-                sid = scf.squeeze(-1) if scf.dim() == 2 else scf  # (B,)
+                sid = scf.squeeze(-1) if scf.dim()==2 else scf  # (B,)
                 if self.special_store_ids:
                     m = torch.zeros_like(sid, dtype=torch.float32)
                     for s in self.special_store_ids:
@@ -561,10 +659,14 @@ class PatchTSTSalesOnly(nn.Module):
 
             w = self.loss_w
             loss = 0.0
-            if w["w_smape"]>0: loss += w["w_smape"] * torch.sum(W*smape) / (W.sum()+eps)
-            if w["w_mae"]  >0: loss += w["w_mae"]   * torch.sum(W*mae)   / (W.sum()+eps)
-            loss += self.w_logmae * torch.sum(W*log_mae) / (W.sum()+eps)
-            loss += self.w_ovr    * torch.sum(W*overshot) / (W.sum()+eps)
+            if w.get("w_smape", 0) > 0:
+                loss += w["w_smape"] * torch.sum(W * smape)   / (W.sum() + eps)
+            if w.get("w_mae", 0) > 0:
+                loss += w["w_mae"]   * torch.sum(W * mae)     / (W.sum() + eps)
+            if w.get("w_logmae", 0) > 0:
+                loss += w["w_logmae"] * torch.sum(W * log_mae) / (W.sum() + eps)
+            if w.get("w_zero", 0) > 0:  # ← overshoot penalty 계수 (이름만 'zero')
+                loss += w["w_zero"] * torch.sum(W * overshot) / (W.sum() + eps)
 
             out.loss = loss
 
@@ -572,24 +674,26 @@ class PatchTSTSalesOnly(nn.Module):
             out.prediction = pred
         return out
 
-def make_model():
+def make_model(context_len: int):
+    # context_len을 인자로 받아서 구성
     config = PatchTSTConfig(
         num_input_channels=1 + len(KNOWN_REAL_COLS),
-        context_length=CONTEXT_LEN,
+        context_length=int(context_len),
         prediction_length=PRED_LEN,
         patch_length=PATCH_LEN,
         patch_stride=PATCH_STRIDE,
-        d_model=256,
-        num_attention_heads=16,
-        num_hidden_layers=4,
-        ffn_dim=512,
-        dropout=0.10,
-        head_dropout=0.10,
+        d_model=320,
+        num_attention_heads=8,
+        num_hidden_layers=6,
+        ffn_dim=640,
+        dropout=0.15,
+        head_dropout=0.15,
         scaling="std",
         loss="mse",
     )
     base = PatchTSTForPrediction(config)
     return PatchTSTSalesOnly(base, target_ch=0, objective=SPLIT_OBJECTIVE)
+
 
 # ----------  # <CELL: metrics>  (NEW)
 
@@ -743,10 +847,11 @@ class RotateEvalAnchors(TrainerCallback):
 # ----------  # <CELL: build dataframes>
 raw = load_train_df()
 raw = enforce_regular_daily(raw)
+raw = add_time_features(raw)      # 캘린더/휴일 피처
+raw = add_rolling_channels(raw)   # 🔥 롤링 채널 추가
 
 le  = fit_or_load_label_encoder(raw["store_menu"])
-feat = add_time_features(raw)
-df   = finalize_columns(feat, le)
+df  = finalize_columns(raw, le)
 
 N_WEEKS = int(df["week_idx"].max()) + 1
 print(f"Rows={len(df)}, Items={df['store_menu_id'].nunique()}, Weeks={N_WEEKS}")
@@ -785,126 +890,236 @@ def make_masks_by_weeks(valid_weeks, all_weeks, purge_gap=1):
     return train_mask, valid_mask
 
 all_weeks_sorted = sorted(df["week_idx"].unique().tolist())
-fold_weeks = contiguous_week_folds(all_weeks_sorted, K_FOLDS)
 
-cv_metrics = []
-for fold, v_weeks in enumerate(fold_weeks):
-    tr_m, va_m = make_masks_by_weeks(v_weeks, all_weeks_sorted, purge_gap=PURGE_GAP_WEEKS)
-    train_df = df.loc[tr_m].copy()
-    valid_df = df.loc[va_m].copy()
+# 컨텍스트별 CV 결과/가중치 저장
+FOLD_WEIGHTS_CTX = {}   # {ctx: [w_fold_0, ...]}
+CV_SUMMARY_CTX   = {}   # {ctx: {"loss":..,"smape":..,"mae":..,"rmse":..,"fold_weights":[..]}}
 
-    train_ds = build_dataset(train_df)
-    valid_ds = build_dataset(valid_df)
+for CTX in CONTEXT_SET:
+    fold_weeks = contiguous_week_folds(all_weeks_sorted, K_FOLDS)
+    cv_metrics = []
+    print(f"\n========== [CV @ context={CTX}] ==========")
 
-    model = make_model()
-    # ADD ↓ 특수 매장 가중 사용
-    model.special_store_ids = SPECIAL_STORE_IDS
+    for fold, v_weeks in enumerate(fold_weeks):
+        tr_m, va_m = make_masks_by_weeks(v_weeks, all_weeks_sorted, purge_gap=PURGE_GAP_WEEKS)
+        train_df = df.loc[tr_m].copy()
+        valid_df = df.loc[va_m].copy()
 
-    trainer = Trainer(
-        model=model,
+        train_ds = build_dataset(train_df, context_len=CTX, prediction_len=PRED_LEN)
+        valid_ds = build_dataset(valid_df, context_len=CTX, prediction_len=PRED_LEN)
+
+        model = make_model(CTX)
+        model.special_store_ids = SPECIAL_STORE_IDS  # 특수 매장 가중
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=valid_ds,
+            data_collator=ts_data_collator,
+            compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE)],
+        )
+        trainer.add_callback(RotateEvalAnchors(trainer, valid_ds, step=ANCHOR_STEP))
+
+        print(f"\n[CV] ctx={CTX} fold={fold} train_rows={len(train_df)} valid_rows={len(valid_df)} weeks={min(v_weeks)}..{max(v_weeks)}")
+        trainer.train()
+        trainer.eval_dataset = valid_ds
+        m = trainer.evaluate()
+
+        # 컨텍스트별 체크포인트 폴더
+        fold_dir = os.path.join(ctx_save_dir(CTX), f"fold_{fold}")
+        trainer.save_model(fold_dir)
+
+        m["fold"] = fold
+        cv_metrics.append(m)
+        print(f"[CV] ctx={CTX} fold={fold} metrics={m}")
+
+    # 컨텍스트별 CV 요약/가중치
+    cv_eval_loss = float(np.mean([m["eval_loss"] for m in cv_metrics]))
+    cv_smape = float(np.mean([m.get("eval_smape", np.nan) for m in cv_metrics]))
+    cv_mae   = float(np.mean([m.get("eval_mae",   np.nan) for m in cv_metrics]))
+    cv_rmse  = float(np.mean([m.get("eval_rmse",  np.nan) for m in cv_metrics]))
+    print(f"[CV ctx={CTX}] avg → loss={cv_eval_loss:.6f}, smape={cv_smape:.6f}, mae={cv_mae:.3f}, rmse={cv_rmse:.3f}")
+
+    fold_smapes = [m.get("eval_smape", np.inf) for m in cv_metrics]
+    if all(np.isfinite(s) for s in fold_smapes) and len(fold_smapes) > 0:
+        w = 1.0 / (np.asarray(fold_smapes) + 1e-6)
+        FOLD_WEIGHTS_CTX[CTX] = (w / w.sum()).astype(float).tolist()
+    else:
+        FOLD_WEIGHTS_CTX[CTX] = [1.0 / max(1, len(cv_metrics))] * max(1, len(cv_metrics))
+
+    CV_SUMMARY_CTX[CTX] = dict(loss=cv_eval_loss, smape=cv_smape, mae=cv_mae, rmse=cv_rmse,
+                               fold_weights=FOLD_WEIGHTS_CTX[CTX])
+
+print("\n[FOLD ENSEMBLE] per-context weights:")
+for k, v in FOLD_WEIGHTS_CTX.items():
+    print(f"  ctx={k} → {v}")
+
+# (NEW) Save fold weights for reuse at inference time
+import json
+w_path = os.path.join(SAVE_DIR, "fold_weights_ctx.json")
+with open(w_path, "w", encoding="utf-8") as f:
+    json.dump(FOLD_WEIGHTS_CTX, f, ensure_ascii=False, indent=2)
+print(f"[SAVE] fold weights saved to {w_path}")
+
+# ----------  # <CELL: final fit (all data)>
+FINAL_METRICS_CTX = {}
+
+for CTX in CONTEXT_SET:
+    print(f"\n========== [FINAL TRAIN @ context={CTX}] ==========")
+    train_all = build_dataset(df, context_len=CTX, prediction_len=PRED_LEN)
+    valid_all = build_dataset(df, context_len=CTX, prediction_len=PRED_LEN)
+
+    final_model = make_model(CTX)
+    final_model.special_store_ids = SPECIAL_STORE_IDS
+
+    final_trainer = Trainer(
+        model=final_model,
         args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=valid_ds,
+        train_dataset=train_all,
+        eval_dataset=valid_all,
         data_collator=ts_data_collator,
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE)],
     )
-    trainer.add_callback(RotateEvalAnchors(trainer, valid_ds, step=ANCHOR_STEP))
+    final_trainer.add_callback(RotateEvalAnchors(final_trainer, valid_all, step=ANCHOR_STEP))
 
-    print(f"\n[CV] fold={fold} train_rows={len(train_df)} valid_rows={len(valid_df)} weeks={min(v_weeks)}..{max(v_weeks)}")
-    trainer.train()
-    trainer.eval_dataset = valid_ds
-    m = trainer.evaluate()
-    fold_dir = os.path.join(SAVE_DIR, f"fold_{fold}")
-    trainer.save_model(fold_dir)
-    m["fold"] = fold
-    cv_metrics.append(m)
-    print(f"[CV] fold={fold} metrics={m}")
+    final_trainer.train()
+    final_trainer.eval_dataset = valid_all
+    final_metrics = final_trainer.evaluate()
+    FINAL_METRICS_CTX[CTX] = final_metrics
+    print(f"[FINAL ctx={CTX}] eval:", final_metrics)
 
-cv_eval_loss = float(np.mean([m["eval_loss"] for m in cv_metrics]))
-cv_smape = float(np.mean([m.get("eval_smape", np.nan) for m in cv_metrics]))
-cv_mae   = float(np.mean([m.get("eval_mae",   np.nan) for m in cv_metrics]))
-cv_rmse  = float(np.mean([m.get("eval_rmse",  np.nan) for m in cv_metrics]))
-print(f"CV avg → loss={cv_eval_loss:.6f}, smape={cv_smape:.6f}, mae={cv_mae:.3f}, rmse={cv_rmse:.3f}")
+    out_dir = os.path.join(ctx_save_dir(CTX), "best")
+    os.makedirs(out_dir, exist_ok=True)
+    final_trainer.save_model(out_dir)
+    print("Saved:", out_dir)
 
-# --- 폴드별 sMAPE 기반 가중치 (작을수록 가중↑) ---
-fold_smapes = [m.get("eval_smape", np.inf) for m in cv_metrics]
-if all(np.isfinite(s) for s in fold_smapes) and len(fold_smapes) > 0:
-    w = 1.0 / (np.asarray(fold_smapes) + 1e-6)
-    FOLD_WEIGHTS = (w / w.sum()).astype(float).tolist()
-else:
-    FOLD_WEIGHTS = [1.0 / max(1, len(cv_metrics))] * max(1, len(cv_metrics))
-print("[FOLD ENSEMBLE] weights:", FOLD_WEIGHTS)
-
-# ----------  # <CELL: final fit (all data)>
-train_all = build_dataset(df)
-valid_all = build_dataset(df)
-
-final_model = make_model()
-final_model.special_store_ids = SPECIAL_STORE_IDS
-
-final_trainer = Trainer(
-    model=final_model,
-    args=training_args,
-    train_dataset=train_all,
-    eval_dataset=valid_all,
-    data_collator=ts_data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE)],
-)
-final_trainer.add_callback(RotateEvalAnchors(final_trainer, valid_all, step=ANCHOR_STEP))
-
-final_trainer.train()
-final_trainer.eval_dataset = valid_all
-final_metrics = final_trainer.evaluate()
-print("FINAL full-data eval:", final_metrics)
-
-final_trainer.save_model(os.path.join(SAVE_DIR, "best"))
-print("Saved:", os.path.join(SAVE_DIR, "best"))
+print("\n[FINAL METRICS by context]")
+for k, v in FINAL_METRICS_CTX.items():
+    print(f"  ctx={k} → {v}")
 print("LabelEncoder:", LE_PATH)
 
-# ----------  # <CELL: load fold models for inference ensemble>
-INFER_TRAINERS = []
+# ----------  # <CELL: load fold models for inference ensemble>  (REPLACE WHOLE CELL)
+
+from copy import deepcopy
+
+INFER_TRAINERS_CTX = {}  # {ctx: [Trainer, ...]}
+
+# (NEW) Try to load saved fold weights (resume-friendly)
+try:
+    import json
+    w_path = os.path.join(SAVE_DIR, "fold_weights_ctx.json")
+    if os.path.exists(w_path):
+        with open(w_path, "r", encoding="utf-8") as f:
+            _saved = json.load(f)
+        # keys가 문자열일 수 있으니 int로 강제 변환
+        FOLD_WEIGHTS_CTX = {int(k): v for k, v in _saved.items()}
+        print(f"[LOAD] fold weights loaded from {w_path}")
+except Exception as e:
+    print(f"[LOAD] fold weights JSON read failed: {e}")
+
 if FOLD_ENSEMBLE:
-    INFER_TRAINERS = []
-    for fold in range(K_FOLDS):
-        fold_dir = os.path.join(SAVE_DIR, f"fold_{fold}")
-        # 둘 중 존재하는 걸 로드
+    for CTX in CONTEXT_SET:
+        trainers = []
+        ctx_dir = ctx_save_dir(CTX)
+        for fold in range(K_FOLDS):
+            fold_dir = os.path.join(ctx_dir, f"fold_{fold}")
+            # 둘 중 존재하는 걸 로드 (.safetensors 우선)
+            bin_path = None
+            for fn in ["model.safetensors", "pytorch_model.bin"]:
+                p = os.path.join(fold_dir, fn)
+                if os.path.exists(p):
+                    bin_path = p
+                    break
+
+            if bin_path is not None:
+                # ★ no-grad 컨텍스트: 모델 생성/로드/모드전환까지 불필요한 그래프 방지
+                with torch.inference_mode():
+                    m = make_model(CTX)
+                    m.special_store_ids = SPECIAL_STORE_IDS
+                    if bin_path.endswith(".safetensors"):
+                        from safetensors.torch import load_file as safe_load
+
+                        sd = safe_load(bin_path)
+                    else:
+                        sd = torch.load(bin_path, map_location="cpu")
+
+                    missing, unexpected = m.load_state_dict(sd, strict=False)
+                    m.eval()
+
+                if missing:    print(f"[ctx {CTX} fold {fold}] missing keys:", len(missing))
+                if unexpected: print(f"[ctx {CTX} fold {fold}] unexpected keys:", len(unexpected))
+
+                # 🔑 추론 전용 TrainingArguments 복사/무력화
+                infer_args = deepcopy(training_args)
+                if hasattr(infer_args, "evaluation_strategy"): infer_args.evaluation_strategy = "no"
+                if hasattr(infer_args, "eval_strategy"):       infer_args.eval_strategy       = "no"
+                infer_args.do_eval                = False
+                infer_args.load_best_model_at_end = False
+                if hasattr(infer_args, "save_strategy"):       infer_args.save_strategy       = "no"
+                infer_args.report_to              = "none"
+                # 워커/퍼시스턴트 비활성화(추론 안정)
+                if hasattr(infer_args, "dataloader_num_workers"):        infer_args.dataloader_num_workers = 0
+                if hasattr(infer_args, "dataloader_persistent_workers"): infer_args.dataloader_persistent_workers = False
+
+                # (가드) collator 미정의 상태로 재개했을 때 대비
+                if 'ts_data_collator' not in globals():
+                    from transformers.data.data_collator import default_data_collator as ts_data_collator
+
+                t = Trainer(
+                    model=m,
+                    args=infer_args,
+                    data_collator=ts_data_collator,
+                )
+                trainers.append(t)
+            else:
+                print(f"[FOLD ENSEMBLE] checkpoint not found in {fold_dir}")
+
+        INFER_TRAINERS_CTX[CTX] = trainers
+        print(f"[FOLD ENSEMBLE] loaded ctx={CTX}: {len(trainers)} fold models.")
+else:
+    # 폴드 앙상블 OFF: 컨텍스트별 'best' 하나씩 로드
+    for CTX in CONTEXT_SET:
+        best_dir = os.path.join(ctx_save_dir(CTX), "best")
         bin_path = None
-        for fn in ["pytorch_model.bin", "model.safetensors"]:
-            p = os.path.join(fold_dir, fn)
+        for fn in ["model.safetensors", "pytorch_model.bin"]:
+            p = os.path.join(best_dir, fn)
             if os.path.exists(p):
                 bin_path = p
                 break
-
+        trainers = []
         if bin_path is not None:
-            m = make_model()
-            if bin_path.endswith(".safetensors"):
-                from safetensors.torch import load_file as safe_load
+            with torch.set_grad_enabled(False):
+                m = make_model(CTX)
+                m.special_store_ids = SPECIAL_STORE_IDS
+                if bin_path.endswith(".safetensors"):
+                    from safetensors.torch import load_file as safe_load
 
-                sd = safe_load(bin_path)
-            else:
-                sd = torch.load(bin_path, map_location="cpu")
+                    sd = safe_load(bin_path)
+                else:
+                    sd = torch.load(bin_path, map_location="cpu")
+                m.load_state_dict(sd, strict=False)
+                m.eval()
 
-            missing, unexpected = m.load_state_dict(sd, strict=False)
-            if missing:
-                print(f"[fold {fold}] missing keys:", len(missing))
-            if unexpected:
-                print(f"[fold {fold}] unexpected keys:", len(unexpected))
+            infer_args = deepcopy(training_args)
+            if hasattr(infer_args, "evaluation_strategy"): infer_args.evaluation_strategy = "no"
+            if hasattr(infer_args, "eval_strategy"):       infer_args.eval_strategy       = "no"
+            infer_args.do_eval                = False
+            infer_args.load_best_model_at_end = False
+            if hasattr(infer_args, "save_strategy"):       infer_args.save_strategy       = "no"
+            infer_args.report_to              = "none"
+            if hasattr(infer_args, "dataloader_num_workers"):        infer_args.dataloader_num_workers = 0
+            if hasattr(infer_args, "dataloader_persistent_workers"): infer_args.dataloader_persistent_workers = False
 
-            t = Trainer(
-                model=m,
-                args=training_args,
-                data_collator=ts_data_collator,
-                compute_metrics=compute_metrics,
-            )
-            INFER_TRAINERS.append(t)
-        else:
-            print(f"[FOLD ENSEMBLE] checkpoint not found in {fold_dir}")
+            if 'ts_data_collator' not in globals():
+                from transformers.data.data_collator import default_data_collator as ts_data_collator
 
-    print(f"[FOLD ENSEMBLE] loaded {len(INFER_TRAINERS)} fold models.")
-else:
-    INFER_TRAINERS = []
+            t = Trainer(model=m, args=infer_args, data_collator=ts_data_collator)
+            trainers.append(t)
+        INFER_TRAINERS_CTX[CTX] = trainers
+        print(f"[SINGLE] loaded ctx={CTX}: {len(trainers)} model(s).")
 
 # ----------  # <CELL: inference> (Replace: helper 포함, sample_submission 저장)
 
@@ -918,13 +1133,6 @@ if torch.cuda.is_available():
 
 # (NEW) 최근 K일이 전부 0이면 미래 7일 0으로 고정하는 가드
 ZERO_RUN_GUARD_DAYS = globals().get("ZERO_RUN_GUARD_DAYS", 14)
-
-def _zero_run_guard(g: pd.DataFrame, yhat: np.ndarray) -> np.ndarray:
-    v = pd.to_numeric(g["매출수량"], errors="coerce").fillna(0).to_numpy()
-    if ZERO_RUN_GUARD_DAYS > 0 and len(v) >= ZERO_RUN_GUARD_DAYS:
-        if v[-ZERO_RUN_GUARD_DAYS:].sum() == 0:
-            return np.zeros_like(yhat, dtype=float)
-    return yhat
 
 # (존재하지 않으면 기본값 세팅 - 네 코드랑 변수명 호환)
 USE_INT_ROUND    = globals().get("USE_INT_ROUND", False)   # 정수 제출 아님: False 권장
@@ -1003,7 +1211,7 @@ def _make_future_rows(store_menu, last_date, horizon=PRED_LEN):
     fut = pd.DataFrame({
         "영업일자": future_dates,
         "영업장명_메뉴명": store_menu,
-        "매출수량": 0.0,
+        "매출수량": np.nan,
         "store_name": store,
         "menu_name": menu,
         "store_menu": store_menu,
@@ -1012,17 +1220,15 @@ def _make_future_rows(store_menu, last_date, horizon=PRED_LEN):
     fut = add_time_features(fut)
     return fut
 
-def _predict_last_window_for_file(file_path, sample_df):
+def _predict_last_window_for_file(file_path):
     """
-    한 개 TEST_xx.csv에 대해:
-      - 각 '영업장명_메뉴명'별 마지막 CTX일 + 미래 7일 구성
-      - 마지막 윈도우 7일만 예측
+    TEST_xx.csv 하나에 대해:
+      - 각 '영업장명_메뉴명'별 마지막 윈도우(CTX별) 구성
+      - 컨텍스트×폴드 앙상블 + (가능하면) 컨텍스트 적응형 가중
       - baseline 포맷(영업일자='TEST_xx+{d}일')으로 레코드 반환
     """
+    import re
     test_prefix = re.search(r"(TEST_\d+)", os.path.basename(file_path)).group(1)
-
-    # 현재 로더의 모델 컨텍스트 길이를 직접 읽어 동기화
-    CTX = int(getattr(final_trainer.model.base.config, "context_length", CONTEXT_LEN))
 
     df_t = pd.read_csv(file_path)
     df_t["date"] = pd.to_datetime(df_t["영업일자"])
@@ -1031,85 +1237,150 @@ def _predict_last_window_for_file(file_path, sample_df):
     df_t["store_menu"] = df_t["store_name"] + "_" + df_t["menu_name"]
     df_t["매출수량"] = pd.to_numeric(df_t["매출수량"], errors="coerce").fillna(0.0)
     df_t.loc[df_t["매출수량"] < 0, "매출수량"] = 0.0
-    df_t["sales"] = df_t["매출수량"].astype(float)  # 나이브 섞기 용
-    # (옵션) 훈련과 동일 정규화를 원하면 주석 해제
+    df_t["sales"] = df_t["매출수량"].astype(float)
+
     df_t = enforce_regular_daily(df_t)
     df_t = add_time_features(df_t)
 
-    records = []
-    for store_menu, g in df_t.groupby("영업장명_메뉴명"):
-        g_raw = g.sort_values("date").copy()  # ← 원본(무패딩) 보관
-        g = leftpad_to_context(g_raw, CTX, store_menu)  # 모델 입력용 패딩
+    # ---- (안전) 컨텍스트 가중 헬퍼: 외부 정의 없으면 내부 fallback 사용
+    def _weekly_strength_and_nz_local(g_: pd.DataFrame) -> tuple[float, float]:
+        v = pd.to_numeric(g_["매출수량"], errors="coerce").fillna(0.0).to_numpy()
+        v28 = v[-28:] if v.size >= 28 else v
+        nz28 = float((v28 > 0).mean()) if v28.size else 0.0
+        try:
+            dow = g_["weekday"].to_numpy()[-len(v28):]
+            if v28.size >= 14 and np.var(v28) > 0:
+                means = [v28[dow == d].mean() for d in range(7) if (dow == d).any()]
+                weekly_strength = float(np.var(means) / (np.var(v28) + 1e-9)) if len(means) >= 2 else 0.0
+            else:
+                weekly_strength = 0.0
+        except Exception:
+            weekly_strength = 0.0
+        return float(np.clip(weekly_strength, 0.0, 1.0)), nz28
 
-        last_date = g["date"].max()
-        fut = _make_future_rows(store_menu, last_date, horizon=PRED_LEN)
-        combo = pd.concat([g, fut], ignore_index=True)
-        combo["sales"] = pd.to_numeric(combo["매출수량"], errors="coerce").fillna(0.0)
-
-        # 마지막 윈도우만 남김
-        combo_tail = combo.iloc[-(CTX + PRED_LEN):].copy()
-
-        # 라벨인코더(테스트 신규 ID 포함) — raw가 없을 수도 있으니 가드
-        base_series = raw["store_menu"] if "raw" in globals() else combo_tail["store_menu"]
-        le2 = fit_or_load_label_encoder(pd.concat([base_series, combo_tail["store_menu"]]))
-        combo_fin = finalize_columns(combo_tail, le2)
-
-        # 이 아이템만 있는 dataset 생성 → 정확히 1 샘플 (모델 CTX로 빌드)
-        ds = build_dataset(combo_fin, context_len=CTX, prediction_len=PRED_LEN)
-
-        # --- Fold ensemble predictors ---
-        # 폴드 모델이 있으면 그것만 사용, 없으면 최종 모델 하나 사용
-        predictors = INFER_TRAINERS if (
-                    FOLD_ENSEMBLE and 'INFER_TRAINERS' in globals() and len(INFER_TRAINERS) > 0) else [final_trainer]
-
-        yhat_list = []
-        for t in predictors:
-            # predict 순간만 워커/배치/퍼시스턴트 워커 설정을 임시로 조정
-            old_workers = getattr(t.args, "dataloader_num_workers", None)
-            old_eval_bs = getattr(t.args, "per_device_eval_batch_size", None)
-            old_persist = getattr(t.args, "dataloader_persistent_workers", None)
-
-            t.args.dataloader_num_workers = 0
-            t.args.per_device_eval_batch_size = min(16, (old_eval_bs or 16))
-            if old_persist is not None:
-                t.args.dataloader_persistent_workers = False
-
+    def _context_mix_weights_fallback(g_: pd.DataFrame, contexts: list[int]) -> dict[int, float]:
+        # 외부 _context_mix_weights가 있으면 그걸 사용
+        if "_context_mix_weights" in globals() and callable(globals()["_context_mix_weights"]):
             try:
-                preds_out = t.predict(ds)
-            finally:
-                # 원복
-                if old_workers is not None:
-                    t.args.dataloader_num_workers = old_workers
-                if old_eval_bs is not None:
-                    t.args.per_device_eval_batch_size = old_eval_bs
+                return globals()["_context_mix_weights"](g_, contexts)
+            except Exception:
+                pass
+        # 내부 간단 적응형: base + (요일성, 희소도) 보정
+        base = {28: 0.35, 56: 0.40, 84: 0.25}
+        w = np.array([base.get(c, 0.0) for c in contexts], dtype=float)
+        if w.sum() <= 0:
+            w = np.ones(len(contexts), dtype=float) / len(contexts)
+        weekly_strength, nz28 = _weekly_strength_and_nz_local(g_)
+        adj = np.zeros_like(w)
+        for i, c in enumerate(contexts):
+            adj[i] += (0.15 * weekly_strength) * (1 if c >= 56 else -1)
+            adj[i] += (0.10 * (1.0 - nz28))   * (1 if c == 28 else (-1 if c >= 84 else 0))
+        w = np.clip(w + adj, 1e-6, None); w = (w / w.sum()).astype(float)
+        return {c: float(w[i]) for i, c in enumerate(contexts)}
+
+    records = []
+
+    for store_menu, g in df_t.groupby("영업장명_메뉴명"):
+        g_raw = g.sort_values("date").copy()
+
+        # 아이템별 컨텍스트 가중(적응형)
+        ctx_weights = _context_mix_weights_fallback(g_raw, CONTEXT_SET)
+
+        yhat_ctx = {}  # {ctx: (7,) 예측}
+        for CTX in CONTEXT_SET:
+            # 입력 구성
+            g_ctx = leftpad_to_context(g_raw, CTX, store_menu)
+            last_date = g_ctx["date"].max()
+            fut = _make_future_rows(store_menu, last_date, horizon=PRED_LEN)
+            combo = pd.concat([g_ctx, fut], ignore_index=True)
+            combo["sales"] = pd.to_numeric(combo["매출수량"], errors="coerce").fillna(0.0)
+            combo = add_rolling_channels(combo)  # 미래구간도 과거통계 carry-forward
+            # 캐리-포워드: 미래 구간(원본 매출수량 NaN)은 마지막 관측값으로 고정
+            fmask = combo["매출수량"].isna()
+            if fmask.any():
+                chs = ["roll7_mean", "roll28_mean", "roll7_med", "nzrate28"]
+                if (~fmask).any():
+                    last_obs_idx = combo.index[~fmask][-1]
+                    for c in chs:
+                        combo.loc[fmask, c] = float(combo.loc[last_obs_idx, c])
+                else:
+                    # 전부 미래(혹은 패딩만)인 극단 케이스: 0으로
+                    for c in chs:
+                        combo.loc[fmask, c] = 0.0
+
+            combo_tail = combo.iloc[-(CTX + PRED_LEN):].copy()
+
+            # 라벨인코더(테스트 신규 ID 포함)
+            base_series = raw["store_menu"] if "raw" in globals() else combo_tail["store_menu"]
+            le2 = fit_or_load_label_encoder(pd.concat([base_series, combo_tail["store_menu"]]))
+            combo_fin = finalize_columns(combo_tail, le2)
+
+            ds = build_dataset(combo_fin, context_len=CTX, prediction_len=PRED_LEN)
+
+            # 이 컨텍스트의 fold 모델들
+            predictors = INFER_TRAINERS_CTX.get(CTX, [])
+            if len(predictors) == 0:
+                print(f"[WARN] no predictors for ctx={CTX}; skip this ctx")
+                continue
+
+            fold_w = np.asarray(FOLD_WEIGHTS_CTX.get(CTX, []), dtype=float)
+            if fold_w.size != len(predictors) or not np.isfinite(fold_w).all():
+                fold_w = np.ones(len(predictors), dtype=float) / len(predictors)
+
+            yhat_list = []
+            for t in predictors:
+                # predict 순간만 워커/배치/퍼시스턴트 워커 설정 임시 조정
+                old_workers = getattr(t.args, "dataloader_num_workers", None)
+                old_eval_bs = getattr(t.args, "per_device_eval_batch_size", None)
+                old_persist = getattr(t.args, "dataloader_persistent_workers", None)
+
+                t.args.dataloader_num_workers = 0
+                t.args.per_device_eval_batch_size = min(16, (old_eval_bs or 16))
                 if old_persist is not None:
-                    t.args.dataloader_persistent_workers = old_persist
+                    t.args.dataloader_persistent_workers = False
 
-            # 로그->원 스케일 & 마지막 샘플 7일만
-            Y = _extract_pred_matrix(preds_out, PRED_LEN, target_ch=0)
-            yhat_i = np.clip(np.expm1(Y[-1]), 0, None)
-            yhat_list.append(yhat_i)
+                try:
+                    with torch.inference_mode():
+                        preds_out = t.predict(ds)
+                finally:
+                    if old_workers is not None:
+                        t.args.dataloader_num_workers = old_workers
+                    if old_eval_bs is not None:
+                        t.args.per_device_eval_batch_size = old_eval_bs
+                    if old_persist is not None:
+                        t.args.dataloader_persistent_workers = old_persist
 
-        S = np.stack(yhat_list, axis=0)  # (n_models, 7)
-        if S.shape[0] == 1:
-            yhat = S[0]
+                # 로그->원 스케일 & 마지막 샘플 7일만
+                Y = _extract_pred_matrix(preds_out, PRED_LEN, target_ch=0)
+                yhat_i = np.clip(np.expm1(Y[-1]), 0, None)
+                yhat_list.append(yhat_i)
+
+            S = np.stack(yhat_list, axis=0)           # (n_folds, 7)
+            yhat_fold_avg = np.average(S, axis=0, weights=fold_w)  # (7,)
+            yhat_ctx[CTX] = yhat_fold_avg
+
+        if not yhat_ctx:
+            # 모든 컨텍스트 실패 시 0
+            yhat = np.zeros(PRED_LEN, dtype=float)
         else:
-            w = np.asarray(globals().get("FOLD_WEIGHTS", []), dtype=float)
-            if w.size != S.shape[0] or not np.isfinite(w).all():
-                print(f"[WARN] FOLD_WEIGHTS invalid (len={w.size}, models={S.shape[0]}) → uniform avg")
-                w = np.ones(S.shape[0], dtype=float) / S.shape[0]
-            yhat = np.average(S, axis=0, weights=w)
+            ctxs = sorted(yhat_ctx.keys())
+            W = np.array([ctx_weights.get(c, 0.0) for c in ctxs], dtype=float)
+            if not np.isfinite(W).all() or W.sum() <= 0:
+                W = np.ones(len(ctxs), dtype=float) / len(ctxs)
+            M = np.stack([yhat_ctx[c] for c in ctxs], axis=0)  # (n_ctx, 7)
+            yhat = np.average(M, axis=0, weights=W)
 
+        # 나이브 블렌딩
         if ENSEMBLE_NAIVE_W > 0:
-            yhat = _blend_with_naive(yhat, g)
+            yhat = _blend_with_naive(yhat, g_raw)
 
-        # 제로-런 가드는 '실제 최근 K일' 기준으로만 판단
+        # 제로-런 가드 & 캡
         yhat = _zero_run_guard(g_raw, yhat)
         cap = ITEM_CAP.get(store_menu, None)
         if cap is not None and np.isfinite(cap):
             yhat = np.minimum(yhat, float(cap) * float(CAP_MULT))
 
-        # 출력 레코드 적재
+        # 출력 적재
         pred_dates = [f"{test_prefix}+{i + 1}일" for i in range(PRED_LEN)]
         for d_str, val in zip(pred_dates, yhat):
             records.append({
@@ -1134,7 +1405,7 @@ else:
         submit_df[c] = 0.0
 
     for p in sorted(test_files):
-        df_pred_one = _predict_last_window_for_file(p, submit_df)
+        df_pred_one = _predict_last_window_for_file(p)
 
         # 이 파일에 해당하는 행만 선택 (예: 'TEST_03+1일' 등)
         pred_index = df_pred_one["영업일자"].unique().tolist()
